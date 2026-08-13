@@ -51,6 +51,13 @@ GARBAGE_TOKENS = {"headright", "boxshadowdwn", "boxshadow"}
 # Watermark patterns
 WATERMARK_REGEX = re.compile(r"^2019[-–]200?$", re.IGNORECASE)
 SINGLE_WATERMARK_CHAR_REGEX = re.compile(r"^[0-9\-–]$")
+# ── Issue J: URL-only block filter ─────────────────────────────────────────
+# Blocks whose entire text is a bare URL (with or without surrounding parens)
+# carry no semantic value for RAG — they are typically image caption source URLs.
+URL_ONLY_RE = re.compile(
+    r"^\(?https?://\S+\)?$",
+    re.IGNORECASE
+)
 
 
 # Y-band tolerance: blocks whose top-Y values are within this many points are
@@ -361,6 +368,11 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if WATERMARK_REGEX.match(text):
             continue
 
+        # Issue J: Drop URL-only blocks (standalone image caption source URLs)
+        if URL_ONLY_RE.match(text):
+            logger.debug(f"URLOnlyFilter: Dropping URL-only block: '{text[:80]}'")
+            continue
+
         cleaned_pass1.append(b)
 
     # Pass 2: Stylized Heading Text Fixes
@@ -593,6 +605,23 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             elif ratio <= _BOTTOM_BAND_RATIO and old_type != "footer":
                 b["type"] = "footer"
                 reclassified += 1
+
+        # Issue G: Reclassify long non-boilerplate 'header' blocks back to 'paragraph'.
+        # Docling assigns type='header' to blocks whose bbox top-Y is near the page top,
+        # but full body paragraphs (>150 chars) are NEVER real running headers.
+        # This must run AFTER the position-based reclassification above so we only
+        # correct Docling's original misclassification, not blocks we just promoted.
+        if (
+            b.get("type") == "header"
+            and not b.get("is_boilerplate", False)
+            and len(text) > 150
+        ):
+            b["type"] = "paragraph"
+            reclassified += 1
+            logger.debug(
+                f"Pass7/LongHeaderFix: Reclassified long header->paragraph "
+                f"(len={len(text)}): '{text[:60]}...'"
+            )
 
     if reclassified:
         logger.info(

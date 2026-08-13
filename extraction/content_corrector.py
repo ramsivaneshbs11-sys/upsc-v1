@@ -141,6 +141,29 @@ OCR_CONFUSION_MAP = {
     r"\bMughalempire\b": "Mughal Empire",
     r"\bmughalempire\b": "Mughal Empire",
     r"\bSubahdar\b": "Subahdar",
+    # ── Issue C: IGNOU Anthropology / BANC-107 OCR confusion pairs ─────────
+    # Residual OCR errors observed in Docling output for IGNOU courseware.
+    # Character substitution pattern: 'c' → 'e', 'rn' → 'm', dropped chars.
+    r"\bInbrceding\b": "Inbreeding",
+    r"\binbrceding\b": "inbreeding",
+    r"\bMeasurcments\b": "Measurements",
+    r"\bmeasurcments\b": "measurements",
+    r"\bCollcction\b": "Collection",
+    r"\bcollcction\b": "collection",
+    r"\bComposd\b": "Composed",
+    r"\bPrintcd\b": "Printed",
+    r"\bGrcatcr\b": "Greater",
+    r"\bgrcatcr\b": "greater",
+    r"\bDclhi\b": "Delhi",
+    r"\bPhasc-Il\b": "Phase-II",
+    r"\bPhasc\b": "Phase",
+    r"\bLathccf\b": "Latheef",
+    r"\blathccf\b": "latheef",
+    r"\bshas\s+defined\b": "has defined",
+    r"\bdealswith\b": "deals with",
+    r"\bDealswith\b": "Deals with",
+    r"\bNew\s+Dehi\b": "New Delhi",
+    r"\bnew\s+dehi\b": "new delhi",
 }
 
 # ── Issue #12: Split-word OCR join patterns ────────────────────────────────────
@@ -205,6 +228,21 @@ RUNNING_HEADER_PHRASES = [
     "Religious Ideas and Movements",
     "Courtly Culture",
     "Women and Gender",
+    # ── Issue H: IGNOU Anthropology (BANC-107) chapter running headers ───────
+    # These chapter titles appear as running headers on the right-hand page margin
+    # and bleed into paragraph tail text when extracted by Docling.
+    "Importance and Implications of Biological Variation",
+    "Introduction to Biological Diversity",
+    "Sources of Genetic Variation",
+    "Genetic Polymorphism",
+    "Role of Bio-cultural Factors",
+    "Ethnic Elements in Indian Population",
+    "Classification of Racial Elements in India",
+    "Major Races of Mankind",
+    "Demographic Anthropology",
+    "Indian Demography",
+    "Inbreeding and Consanguinity",
+    "Biological Diversity in Human Populations",
 ]
 
 # Build regex for trailing running-header detection at paragraph end.
@@ -213,6 +251,30 @@ _HEADER_TAIL_PATTERNS = [
     re.compile(r"\s*" + re.escape(phrase) + r"\s*$")
     for phrase in RUNNING_HEADER_PHRASES
 ]
+
+# ── Issue C: Citation page-range de-garbler ────────────────────────────────
+# OCR of academic citation page ranges sometimes produces a duplicated leading
+# digit prefix, e.g. "pp. 4452-471" instead of "pp. 452-471".
+# Pattern: pp. followed by a number where the first 1-2 digits are duplicated.
+_CITATION_PAGERANGE_RE = re.compile(
+    r"(pp?\.\s*)(\d)(\d{2,3})(-\d{2,4})"
+)
+
+def _fix_citation_page_ranges(text: str) -> str:
+    """
+    Issue C: Fixes garbled academic citation page ranges.
+    Example: 'pp. 4452-471' -> 'pp. 452-471'
+             'p. 1123-34'   -> 'p. 123-34'
+    """
+    def _fix_range(m: re.Match) -> str:
+        prefix  = m.group(1)   # "pp. "
+        dup     = m.group(2)   # leading duplicated digit
+        rest    = m.group(3)   # remaining digits
+        end     = m.group(4)   # "-471"
+        correct_start = rest   # drop the duplicated leading digit
+        return f"{prefix}{correct_start}{end}"
+
+    return _CITATION_PAGERANGE_RE.sub(_fix_range, text)
 
 # ── Issue #11: URL whitespace normalization ────────────────────────────────────
 # Removes stray spaces inside URL segments (common in scanned PDFs where
@@ -351,6 +413,9 @@ class ContentCorrector:
 
         # Rule 8: Issue #11 — URL whitespace normalization
         corrected = _normalize_url_spaces(corrected)
+
+        # Rule 8b: Issue C — Citation page-range de-garbler ("pp. 4452-471" -> "pp. 452-471")
+        corrected = _fix_citation_page_ranges(corrected)
 
         # Rule 9: Issue #6 — Strip running-header contamination (tail & inline)
         corrected = _strip_running_header_tail(corrected)

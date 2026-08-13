@@ -92,6 +92,25 @@ def get_docling_converter(
     return converter
 
 
+# ── Issue E: Mojibake / Garbled-text detection ────────────────────────────────
+_PRINTABLE_RE = re.compile(r"[^\x20-\x7E\u00A0-\u024F\u0900-\u097F]")  # non-printable / non-Latin / non-Devanagari
+
+
+def _has_mojibake(text: str, threshold: float = 0.40) -> bool:
+    """
+    Returns True if more than *threshold* fraction of characters in *text* are
+    non-printable, control characters, or private-use-area codepoints — the
+    hallmarks of mojibake (garbled / mis-encoded text).
+
+    A threshold of 0.40 means if >40% of characters fail the printability check
+    the block is considered corrupt and is flagged for VLM fallback.
+    """
+    if not text:
+        return False
+    bad = len(_PRINTABLE_RE.findall(text))
+    return (bad / len(text)) > threshold
+
+
 # ── 2. ELEMENT PARSER ─────────────────────────────────────────────────────────
 
 def parse_docling_elements(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -119,7 +138,10 @@ def parse_docling_elements(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[st
                 label_str = str(item.label).lower()
                 if "heading" in label_str or "title" in label_str or "section" in label_str:
                     label = "heading"
-                elif "list" in label_str:
+                # Issue B: Expanded list-item detection — Docling uses multiple
+                # variants: 'list_item', 'list-item', 'ordered_list', 'unordered_list',
+                # 'bullet', 'item'. Catch all of them before checking footer/header.
+                elif any(x in label_str for x in ["list", "item", "ordered", "unordered", "bullet"]):
                     label = "list_item"
                 elif "caption" in label_str:
                     label = "caption"
@@ -153,8 +175,16 @@ def parse_docling_elements(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[st
                 "page_num": page_num,
                 "type": label,
                 "text": text,
-                "bbox": bbox
+                "bbox": bbox,
+                # Issue E: Flag blocks whose text is mostly garbled/mojibake
+                "encoding_error": _has_mojibake(text),
             })
+            if _has_mojibake(text):
+                logger.warning(
+                    f"MojibakerDetector: Block blk_{block_id_counter:04d} on page {page_num} "
+                    f"has >40% non-printable chars — flagged encoding_error=True. "
+                    f"Consider Gemini VLM fallback for this page."
+                )
             block_id_counter += 1
 
     # Extract tables
@@ -700,6 +730,11 @@ def _deduplicate_blocks(text_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any
     """
     Removes near-identical consecutive duplicate blocks on the same page that can arise
     when Docling produces a second linear-text pass.
+
+    Issue A fix: upgraded from consecutive-only check to a page-level sliding-window
+    seen-set (up to 10 blocks back per page). This catches non-consecutive duplicates
+    that occur when Docling emits both a raw layout pass and a cleaner re-flowed pass
+    for the same page content.
     """
     if not text_blocks:
         return text_blocks
@@ -712,6 +747,10 @@ def _deduplicate_blocks(text_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any
         text = re.sub(r"\s+", " ", text).strip().lower()
         return text[:120]
 
+    # Per-page sliding window: track fingerprints of the last N blocks seen per page
+    _WINDOW_SIZE = 10
+    page_windows: Dict[int, List[str]] = {}  # page_num -> list of recent fingerprints
+
     deduped: List[Dict[str, Any]] = []
 
     for b in text_blocks:
@@ -719,12 +758,18 @@ def _deduplicate_blocks(text_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any
         fp = _fingerprint(text)
         p_num = b.get("page_num")
 
-        # Consecutive duplicate check on same page
-        if deduped:
-            prev_b = deduped[-1]
-            if prev_b.get("page_num") == p_num and _fingerprint(prev_b.get("text", "")) == fp:
-                logger.debug(f"Dedup: removing consecutive duplicate block on page {p_num}: '{text[:60]}...'")
-                continue
+        window = page_windows.setdefault(p_num, [])
+
+        if fp in window:
+            logger.debug(
+                f"Dedup: removing page-level duplicate on page {p_num}: '{text[:60]}...'"
+            )
+            continue
+
+        # Maintain sliding window (evict oldest if over limit)
+        window.append(fp)
+        if len(window) > _WINDOW_SIZE:
+            window.pop(0)
 
         deduped.append(b)
 

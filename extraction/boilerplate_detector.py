@@ -58,6 +58,12 @@ HEADER_PATTERNS = [
     r"(?i)^\s*violence\s+by\s+non[-\s]state\s+actors\s*$",
     r"(?i)^\s*unit\s+\d+\s*$",                # bare "Unit 27" style running header
     r"(?i)^\s*block[-\s]\d+\s*$",             # bare "Block-8" style running header
+    # ── Issue D: IGNOU watermark / logo text ─────────────────────────────────
+    # "ignou THE PEOPLE'S UNIVERSITY" and variants appear as watermark or
+    # background logo text extracted onto every page of IGNOU course booklets.
+    r"(?i)^\s*ignou\s+the\s+people[''']?s\s+university\s*$",
+    r"(?i)^\s*the\s+people[''']?s\s+university\s*$",
+    r"(?i)^\s*ignou\s*$",                      # standalone IGNOU logo text
 ]
 
 FOOTER_PATTERNS = [
@@ -123,6 +129,13 @@ TOC_PATTERNS = [
     r"_{4,}\s*\d+\s*$",                        # Underscores leading to number
     r"(?i)^\s*contents\s*$",
     r"(?i)^\s*table\s+of\s+contents\s*$",
+    # ── Issue I: IGNOU TOC entries — "Unit 4 Demographic Data 205" style ────
+    # Lines where the last token is a 2-3 digit page number, and preceding
+    # text is 5-80 chars (unit/section names). Avoids false-positives on
+    # normal paragraph text ending with a year (4 digits).
+    r"^.{5,80}\s+\d{2,3}\s*$",
+    r"(?i)^\s*course\s+contents\s*$",
+    r"(?i)^\s*pages?\s*$",                     # standalone "Pages" header on TOC page
 ]
 
 WATERMARK_PATTERNS = [
@@ -250,6 +263,32 @@ class BoilerplateDetector:
                     block["type"] = "header"
                 elif bp_type == "footer":
                     block["type"] = "footer"
+
+        # Pass 3b: Issue F — Enforce is_boilerplate=True for blocks that Docling
+        # labeled as type "footer" or "header" via its internal layout model but
+        # that our pattern/position checks did NOT flag (is_boilerplate still False).
+        # These blocks would bypass text_cleaner.py's boilerplate filter, causing
+        # footer/header text to enter the RAG embedding pipeline.
+        # Guard: skip exercise_heading and bibliography blocks which are
+        # intentionally is_boilerplate=False despite their special type labels.
+        _PROTECTED_BP_TYPES = {"exercise_heading", "bibliography"}
+        for block in blocks:
+            if block.get("boilerplate_type") in _PROTECTED_BP_TYPES:
+                continue
+            if not block.get("is_boilerplate", False):
+                b_type = block.get("type", "")
+                if b_type in ("footer", "header"):
+                    # Only enforce if the text is short (< 120 chars) — real body
+                    # paragraphs misclassified as header/footer by position are
+                    # handled separately by block_cleaner Pass 7.
+                    text = block.get("text", "").strip()
+                    if len(text) < 120:
+                        block["is_boilerplate"] = True
+                        block["boilerplate_type"] = b_type
+                        logger.debug(
+                            f"Pass3b/FlagMismatch: '{text[:60]}' — "
+                            f"type='{b_type}' was not boilerplate-flagged; corrected."
+                        )
 
         # Pass 4: Issue #2 — Reclassify ToC page-number-only footer blocks on ToC pages
         blocks = self._reclassify_toc_page_numbers(blocks)
