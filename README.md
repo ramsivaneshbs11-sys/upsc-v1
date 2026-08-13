@@ -4,9 +4,20 @@ A production-grade, single-endpoint FastAPI application designed to register, va
 
 ---
 
-## 🚀 Workflow Architecture
+## 🚀 API Endpoints & Ingestion Pipelines
 
-The single endpoint `POST /api/v1/documents` executes the complete pipeline sequentially:
+The FastAPI application provides **two high-performance endpoints** to ingest and process UPSC PDF documents:
+
+1. **v1 Endpoint (`POST /api/v1/documents`)**:
+   - **Engine**: Local **Docling v2.0** layout models.
+   - **Best For**: Digital, selectable-text PDFs.
+   - **Feature**: Fast, runs locally (CPU), and uses targeted OCR fallbacks for damaged/blank pages.
+2. **v2 Endpoint (`POST /api/v2/documents`)**:
+   - **Engine**: Cloud **Gemini Flash** (VLM).
+   - **Best For**: Scanned, complex, or multi-column PDFs.
+   - **Feature**: End-to-end VLM-powered page rendering and text/table extraction with 10-key failover rotation.
+
+Both endpoints execute the same overall sequential workflow:
 
 ```
 PDF File + Classification (History / Anthropology)
@@ -21,20 +32,22 @@ PDF File + Classification (History / Anthropology)
          3. Save PDF to uploads/<class>/
                      │
                      ▼
-      4. Register in PostgreSQL (status=registered)
+       4. Register in PostgreSQL (status=registered)
                      │
                      ▼
-      5. Run Docling PDF Data Extraction (status=extracting -> extracted)
+       5. Document Data Extraction (status=extracting -> extracted)
+          (v1: Local Docling | v2: Gemini Flash VLM)
                      │
                      ▼
-     6. Text Preprocessing & Layout Chunking (status=preprocessing -> preprocessed)
+      6. Text Preprocessing & Layout Chunking (status=preprocessing -> preprocessed)
                      │
                      ▼
-    7. BAAI/bge-base-en-v1.5 Embedding Generation (status=embedding)
+     7. BAAI/bge-base-en-v1.5 Embedding Generation (status=embedding)
                      │
                      ▼
-   8. Qdrant Vector DB Ingestion per Classification (status=ingested)
+    8. Qdrant Vector DB Ingestion per Classification (status=ingested)
 ```
+
 
 ---
 
@@ -106,7 +119,9 @@ We performed a comprehensive quality audit on all **77 active PDFs** in the RAG 
 ```
 upsc-2/
 ├── app/
-│   ├── api/routes/documents.py  # Single endpoint POST /api/v1/documents
+│   ├── api/routes/
+│   │   ├── documents.py         # Endpoint v1: POST /api/v1/documents (Docling)
+│   │   └── extract_page.py      # Endpoint v2: POST /api/v2/documents (Gemini VLM)
 │   ├── core/config.py           # Configuration loader (.env & defaults)
 │   ├── database/
 │   │   ├── session.py           # SQLAlchemy connection setup
@@ -115,11 +130,16 @@ upsc-2/
 │   ├── services/
 │   │   ├── storage_service.py      # PDF disk storage handler
 │   │   ├── extraction_service.py   # Docling extraction & QA audit bridge
+│   │   ├── page_extraction_service.py # Gemini page-by-page extraction service
 │   │   ├── preprocessing_service.py# Layout-aware chunking service
 │   │   ├── embedding_service.py    # SentenceTransformer (BGE) vector generator
 │   │   └── qdrant_service.py       # Qdrant collection manager & vector upsert
 │   └── main.py                  # FastAPI application entry point
-├── extraction/                  # Docling parsing modules & postprocessors
+├── extraction/                  # Docling & Gemini parsing modules
+│   ├── gemini_client.py         # Google GenAI client utilities
+│   ├── gemini_page_extractor.py # Gemini full document VLM extraction
+│   ├── docling_extractor.py     # Local Docling parser with fallbacks
+│   └── ...                      # Visual detectors, postprocessors, cleaners
 ├── preprocessing/               # Cleaning & layout-aware chunking engine
 ├── docker-compose.yml           # Docker services for PostgreSQL and Qdrant
 ├── .env.example                 # Environment configuration template
@@ -153,6 +173,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/upsc_rag
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
 EMBEDDING_MODEL_NAME=BAAI/bge-base-en-v1.5
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
 ### 3. Install Python Dependencies
@@ -179,11 +200,14 @@ python -m uvicorn app.main:app --reload
 ## 🧪 Testing Document Ingestion
 
 ### Via Swagger UI (`/docs`)
-1. Expand the `POST /api/v1/documents` endpoint.
+1. Expand either of the ingestion endpoints:
+   - `POST /api/v1/documents` (v1 — Local Docling Engine)
+   - `POST /api/v2/documents` (v2 — Gemini Flash VLM Engine)
 2. Click **Try it out**.
 3. Select a `.pdf` file in the `file` parameter.
 4. Set `classification` to `History` or `Anthropology`.
 5. Click **Execute**.
+
 
 ### Pipeline Status Transitions
 The API tracks status transitions in PostgreSQL:
