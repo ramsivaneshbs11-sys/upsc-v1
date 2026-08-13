@@ -25,6 +25,9 @@ _FULL_PAGE_BBOXES = {
     (0, 0, 595.0, 842.0),
     (0.0, 0.0, 595.2755737304688, 841.8897705078125),
     (0, 0, 595.2755737304688, 841.8897705078125),
+    # US Letter dimensions — Issue 4: Anthropology courseware page 17 blob
+    (0.0, 0.0, 612.0, 792.0),
+    (0, 0, 612.0, 792.0),
 }
 
 def _is_full_page_bbox(bbox) -> bool:
@@ -385,7 +388,12 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for b in sorted_blocks:
         bbox = b.get("bbox")
         if _is_full_page_bbox(bbox):
-            b["bbox_approximate"] = True
+            b["bbox_approximate"]  = True
+            b["is_collapsed_blob"] = True   # Issue 4: signals text_cleaner to split by newline
+            logger.debug(
+                f"CollapsedBlob: Block '{b.get('block_id')}' on page {b.get('page_num')} "
+                f"has a full-page bbox — flagged as collapsed blob."
+            )
 
     # Pass 4: Rejoin Split Captions on the same page
     rejoined_blocks = []
@@ -419,6 +427,81 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             continue
         deduped_blocks.append(b)
 
+    # Pass 6b: Issue 1 — Shredded table fragment detection & merge
+    # If a page has ≥ 15 consecutive heading-typed blocks AND any of them starts with
+    # a numeric prefix ("1.", "2.", ...), Docling has mistaken table rows for headings.
+    # Fix: filter out boilerplate lines, sort by Y-desc then X-asc for reading order,
+    # and set bbox=None (the first_block bbox was wrong — a footer bbox, not a table bbox).
+    _NUMBERED_PREFIX = re.compile(r'^\d+\.\s')
+    _MIN_SHREDDED_FRAGMENTS = 15
+    # Boilerplate phrases that sneak into shredded table fragments
+    _SHRED_BOILERPLATE = re.compile(
+        r'^(anthropology|formation of new population and species|\d{1,3})$',
+        re.IGNORECASE
+    )
+
+    pages_headings: Dict[int, List[int]] = {}   # page_num -> list of indices in deduped_blocks
+    for i, b in enumerate(deduped_blocks):
+        if b.get("type") == "heading":
+            p = b.get("page_num", 0)
+            pages_headings.setdefault(p, []).append(i)
+
+    shredded_pages: Set[int] = set()
+    for p, indices in pages_headings.items():
+        heading_texts = [deduped_blocks[i].get("text", "") for i in indices]
+        has_numbered  = any(_NUMBERED_PREFIX.match(t.strip()) for t in heading_texts)
+        if len(indices) >= _MIN_SHREDDED_FRAGMENTS and has_numbered:
+            shredded_pages.add(p)
+            logger.info(
+                f"ShredTable: Page {p} has {len(indices)} heading fragments with numeric "
+                f"prefixes — merging into table_fragment block."
+            )
+
+    if shredded_pages:
+        merged_blocks: List[Dict[str, Any]] = []
+        for p in shredded_pages:
+            indices = pages_headings[p]
+            # Sort fragment blocks by reading order: Y-descending (top of page first in
+            # Docling's inverted Y), then X-ascending (left-to-right)
+            frag_blocks = [deduped_blocks[i] for i in indices]
+            def _frag_sort_key(b):
+                bbox = b.get("bbox") or [0, 0, 0, 0]
+                return (-float(bbox[1]), float(bbox[0]))
+            frag_blocks_sorted = sorted(frag_blocks, key=_frag_sort_key)
+            # Filter out boilerplate lines that leaked into the heading fragments
+            frag_texts = [
+                b.get("text", "").strip() for b in frag_blocks_sorted
+                if not _SHRED_BOILERPLATE.match(b.get("text", "").strip())
+                and b.get("text", "").strip()
+            ]
+            merged_blocks.append({
+                "block_id":       f"blk_shred_p{p}",
+                "page_num":       p,
+                "type":           "table_fragment",
+                "text":           "\n".join(frag_texts),
+                "bbox":           None,   # first_block bbox was a footer bbox — not valid for table
+                "is_boilerplate": False,
+                "was_corrected":  True,
+                "entities":       [],
+                "note":           f"Merged {len(frag_texts)} shredded heading fragments "
+                                  f"(Docling table mis-detection on page {p}), sorted by reading order."
+            })
+
+        # Rebuild deduped_blocks: drop shredded heading indices, insert merged blocks
+        rebuilt: List[Dict[str, Any]] = []
+        shredded_indices = {i for p in shredded_pages for i in pages_headings[p]}
+        for i, b in enumerate(deduped_blocks):
+            if i in shredded_indices:
+                continue
+            rebuilt.append(b)
+        # Insert merged table_fragment blocks in page order
+        for mb in merged_blocks:
+            insert_pos = next(
+                (j for j, b in enumerate(rebuilt) if b.get("page_num", 0) >= mb["page_num"]),
+                len(rebuilt)
+            )
+            rebuilt.insert(insert_pos, mb)
+        deduped_blocks = rebuilt
     # Pass 6: Issue #3 — Emit blank-page markers for pages with no non-boilerplate content
     # Collect all page numbers seen
     if deduped_blocks:
@@ -465,6 +548,56 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for idx, b in enumerate(deduped_blocks, start=1):
         b["block_id"] = f"blk_{idx:04d}"
 
+    # Pass 7: Issue 5 — Header/footer reclassification by vertical position
+    # Two blocks in the same horizontal band should have the same type.
+    # Use bbox[1] (top-Y in Docling's inverted-Y = high value means near top of page).
+    # Page height is approximated from the max Y seen across all blocks on the page.
+    _TOP_BAND_RATIO    = 0.85   # bbox[1] > 85% of page_height → it's a header (near top)
+    _BOTTOM_BAND_RATIO = 0.15   # bbox[1] < 15% of page_height → it's a footer (near bottom)
+
+    # Compute per-page height from max bbox[1] seen
+    page_max_y: Dict[int, float] = {}
+    for b in deduped_blocks:
+        bbox = b.get("bbox")
+        if bbox and len(bbox) == 4:
+            p = b.get("page_num", 1)
+            page_max_y[p] = max(page_max_y.get(p, 0.0), float(bbox[1]))
+
+    reclassified = 0
+    for b in deduped_blocks:
+        bbox = b.get("bbox")
+        if not bbox or len(bbox) < 4:
+            continue
+        p      = b.get("page_num", 1)
+        max_y  = page_max_y.get(p, 792.0)
+        if max_y == 0:
+            continue
+        y_top  = float(bbox[1])
+        ratio  = y_top / max_y
+
+        old_type = b.get("type", "")
+        # Issue 3 fix: protect body-metadata paragraph blocks near the top of page
+        # from being wrongly reclassified as 'header'.
+        # These are short label blocks like "Paper No.", "Module :" that happen to be
+        # in the upper portion of the page but are NOT running page headers.
+        text = b.get("text", "").strip()
+        is_metadata_label = (
+            old_type == "paragraph"
+            and len(text.split()) <= 4
+            and not b.get("is_boilerplate", False)
+        )
+        if old_type in ("header", "footer", "paragraph", "heading"):
+            if ratio >= _TOP_BAND_RATIO and old_type != "header" and not is_metadata_label:
+                b["type"] = "header"
+                reclassified += 1
+            elif ratio <= _BOTTOM_BAND_RATIO and old_type != "footer":
+                b["type"] = "footer"
+                reclassified += 1
+
+    if reclassified:
+        logger.info(
+            f"HeaderFooterReclassify: Reclassified {reclassified} blocks by vertical position."
+        )
+
     logger.info(f"Block cleaner pass complete: Input {len(blocks)} blocks -> Output {len(deduped_blocks)} cleaned blocks")
     return deduped_blocks
-

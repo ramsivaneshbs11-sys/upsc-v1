@@ -1403,34 +1403,74 @@ def extract_document(
             generate_page_images=opts.get("generate_page_images", False)
         )
 
-    # Step 1: Docling Conversion
-    try:
-        conv_result = converter.convert(str(pdf_path))
-        doc = conv_result.document
-        text_blocks, tables = parse_docling_elements(doc)
-    except Exception as exc:
-        logger.warning(
-            f"Docling conversion failed for {pdf_path.name}: {exc}. "
-            f"Falling back to 100% PyMuPDF / Fitz extraction."
-        )
-        doc = None
-        text_blocks, tables = [], []
-
-    # Step 2: Coverage Check
-    # NOTE: We intentionally skip full-document OCR retry here because it doubles RAM
-    # usage and causes std::bad_alloc crashes on large PDFs. Missing pages are recovered
-    # safely page-by-page in Step 3 (Hybrid Fitz Fallback).
+    # Step 1: Docling Conversion (Page-by-page to limit memory usage and prevent OOM/std::bad_alloc)
+    text_blocks, tables = [], []
+    doc = None
+    total_pdf_pages = 0
+    page_widths = {}
+    
     try:
         pdf_doc = fitz.open(str(pdf_path))
         total_pdf_pages = len(pdf_doc)
-        # Collect per-page widths for Fix 1 (column-aware reordering)
-        page_widths: Dict[int, float] = {
+        page_widths = {
             i + 1: pdf_doc[i].rect.width for i in range(total_pdf_pages)
         }
+        
+        # We will create temporary single-page PDFs in the output directory
+        temp_dir = output_dir / "temp_pages"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        for page_idx in range(total_pdf_pages):
+            p_num = page_idx + 1
+            temp_pdf_path = temp_dir / f"page_{p_num:04d}.pdf"
+            try:
+                # Save single page to temp PDF
+                temp_doc = fitz.open()
+                temp_doc.insert_pdf(pdf_doc, from_page=page_idx, to_page=page_idx)
+                temp_doc.save(str(temp_pdf_path))
+                temp_doc.close()
+                
+                # Convert single page
+                conv_result = converter.convert(str(temp_pdf_path))
+                p_doc = conv_result.document
+                p_text_blocks, p_tables = parse_docling_elements(p_doc)
+                
+                # Re-map page numbers to actual p_num
+                for b in p_text_blocks:
+                    b["page_num"] = p_num
+                for t in p_tables:
+                    t["page_num"] = p_num
+                    
+                text_blocks.extend(p_text_blocks)
+                tables.extend(p_tables)
+                
+            except Exception as page_exc:
+                logger.warning(
+                    f"Docling page-by-page conversion failed for page {p_num}: {page_exc}. "
+                    f"Will be recovered by Hybrid Fitz Fallback."
+                )
+            finally:
+                # Clean up temp page file
+                if temp_pdf_path.exists():
+                    try:
+                        temp_pdf_path.unlink()
+                    except Exception:
+                        pass
+                gc.collect()
+                
+        # Clean up temp directory
+        try:
+            temp_dir.rmdir()
+        except Exception:
+            pass
+            
         pdf_doc.close()
-    except Exception:
-        total_pdf_pages = 0
-        page_widths = {}
+    except Exception as exc:
+        logger.warning(
+            f"Docling page-by-page conversion initialization failed for {pdf_path.name}: {exc}. "
+            f"Falling back to 100% PyMuPDF / Fitz extraction."
+        )
+        text_blocks, tables = [], []
 
     covered_pages = {b.get("page_num") for b in text_blocks if isinstance(b.get("page_num"), int)}
     covered_pages.update({t.get("page_num") for t in tables if isinstance(t.get("page_num"), int)})
@@ -1494,6 +1534,11 @@ def extract_document(
     # - Flags generic-header and sparse-row tables with needs_review=True
     #   rather than deleting them, preserving potentially valid data for human audit.
     tables, text_blocks = filter_degenerate_tables(tables, text_blocks)
+
+    # 4f-iii. Post-process extracted tables to fix column wrap/misalignment (Issue 2)
+    # and duplicate headers (Issue 6)
+    from extraction.table_service import _postprocess_table
+    tables = [_postprocess_table(t) for t in tables]
 
     # 4g. Re-index block_ids contiguously after all additions/removals (blk_0001 → blk_N)
     for idx, b in enumerate(text_blocks, start=1):

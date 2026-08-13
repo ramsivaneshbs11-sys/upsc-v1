@@ -23,3 +23,8 @@ Thumbs.db
 # Runtime / Data directories
 data/
 uploads/
+
+# Document files & page visual renders
+*.pdf
+*.png
+

@@ -18,6 +18,9 @@ pdfplumber>=0.10.0
 rapidocr-onnxruntime>=1.3.0
 onnxruntime>=1.15.0
 
+# Gemini 2.5 Flash (Endpoint 2 extraction engine)
+google-genai>=1.0.0
+
 
 # Preprocessing & Chunking Stage
 pydantic>=2.0.0

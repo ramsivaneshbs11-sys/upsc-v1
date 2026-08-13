@@ -40,6 +40,10 @@ EMBEDDING_MODEL_NAME: str = os.environ.get(
 )
 EMBEDDING_DIMENSION: int = 768  # Output dimension of BAAI/bge-base-en-v1.5
 
+# ── Gemini 2.5 Flash (Endpoint 2) ────────────────────────────────────────────────
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL:   str = "gemini-3.5-flash"
+
 # Ensure directories exist on startup
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 (UPLOAD_DIR / "history").mkdir(parents=True, exist_ok=True)

@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 
 from app.database.session import engine, Base
 from app.api.routes import documents
+from app.api.routes import extract_page as extract_page_v2
 from app.services.qdrant_service import ensure_collections
 
 
@@ -57,15 +58,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="UPSC RAG — Document Ingestion API",
     description=(
-        "Single endpoint to register and extract UPSC PDF documents.\n\n"
-        "**Pipeline:** Validate → Save → Register (PostgreSQL) → Extract (Docling) → Update status"
+        "Two extraction endpoints for UPSC PDF documents.\n\n"
+        "**v1** — `POST /api/v1/documents` — Local Docling extraction (digital PDFs)\n"
+        "**v2** — `POST /api/v2/documents` — Gemini 2.5 Flash extraction (all PDFs)\n\n"
+        "**Pipeline (both):** Validate → Save → Register (PostgreSQL) → Extract → Preprocess + Chunk → Embed → Qdrant"
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────
 app.include_router(documents.router)
+app.include_router(extract_page_v2.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────
