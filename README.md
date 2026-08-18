@@ -6,18 +6,22 @@ A production-grade, single-endpoint FastAPI application designed to register, va
 
 ## 🚀 API Endpoints & Ingestion Pipelines
 
-The FastAPI application provides **two high-performance endpoints** to ingest and process UPSC PDF documents:
+The FastAPI application provides **three high-performance endpoints** to ingest, process, and query UPSC PDF documents:
 
-1. **v1 Endpoint (`POST /api/v1/documents`)**:
+1. **v1 Ingestion Endpoint (`POST /api/v1/documents`)**:
    - **Engine**: Local **Docling v2.0** layout models.
    - **Best For**: Digital, selectable-text PDFs.
    - **Feature**: Fast, runs locally (CPU), and uses targeted OCR fallbacks for damaged/blank pages.
-2. **v2 Endpoint (`POST /api/v2/documents`)**:
+2. **v2 Ingestion Endpoint (`POST /api/v2/documents`)**:
    - **Engine**: Cloud **Gemini Flash** (VLM).
    - **Best For**: Scanned, complex, or multi-column PDFs.
    - **Feature**: End-to-end VLM-powered page rendering and text/table extraction with 10-key failover rotation.
+3. **v1 Query Endpoint (`POST /api/v1/query`)**:
+   - **Engine**: Hybrid Vector + Web Search Retrieval Layer.
+   - **Best For**: Querying the UPSC corpus and generating context-aware answers.
+   - **Feature**: Uses LLM-based query classification to route either to high-precision vector DB search (with reranking) or a web search fallback.
 
-Both endpoints execute the same overall sequential workflow:
+Both ingestion endpoints execute the same overall sequential workflow:
 
 ```
 PDF File + Classification (History / Anthropology)
@@ -94,6 +98,46 @@ For robust processing across diverse document types, the pipeline uses a **Hybri
 
 ---
 
+## 🔍 Hybrid Retrieval & RAG Router (Query Flow)
+
+When a user submits a query to `/api/v1/query`, the system processes it through a multi-stage retrieval router:
+
+```
+                      [ User Query ]
+                             │
+                             ▼
+                 [ LLM Query Classifier ]
+                             │
+            ┌────────────────┴────────────────┐
+            ▼                                 ▼
+   [ HIGH CONFIDENCE ]                [ LOW CONFIDENCE ]
+  (Directly UPSC-related)            (General/Out-of-domain)
+            │                                 │
+            ▼                                 ▼
+   [ Vector DB Search ]             [ Web Search Fallback ]
+  (Fetch top K candidates)          (DuckDuckGo search API)
+            │                                 │
+            ▼                                 │
+    [ Cross-Encoder ]                         │
+    (Rerank candidate)                        │
+            │                                 │
+            └───────────────┬─────────────────┘
+                            │
+                            ▼
+               [ Context Construction ]
+                            │
+                            ▼
+              [ LLM Response Generation ]
+              (Generate final UPSC answer)
+```
+
+1. **LLM Query Classifier**: Evaluates whether the query requires direct access to the ingested UPSC corpus (High Confidence) or is general/out-of-domain (Low Confidence).
+2. **Vector DB Search & Reranking**: If the query is high confidence, it executes a vector search in Qdrant, retrieves the top candidates (`RETRIEVAL_CANDIDATE_K`), and then reranks them using a cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v2`) to find the top `RETRIEVAL_FINAL_TOP_K` relevant chunks.
+3. **Web Search Fallback**: If the query is low confidence, it executes a DuckDuckGo search to retrieve contextual information.
+4. **LLM Response Generation**: Synthesizes the final answer using the compiled context and the generator LLM (Groq or Gemini).
+
+---
+
 ## 📊 Extraction Accuracy & Evaluation Metrics
 
 We performed a comprehensive quality audit on all **77 active PDFs** in the RAG corpus, using a multi-pass evaluation criteria (assessing reading order, completeness, continuity, formatting, OCR errors, duplicates, and integrity).
@@ -121,19 +165,28 @@ upsc-2/
 ├── app/
 │   ├── api/routes/
 │   │   ├── documents.py         # Endpoint v1: POST /api/v1/documents (Docling)
-│   │   └── extract_page.py      # Endpoint v2: POST /api/v2/documents (Gemini VLM)
+│   │   ├── extract_page.py      # Endpoint v2: POST /api/v2/documents (Gemini VLM)
+│   │   └── query.py             # Endpoint Query: POST /api/v1/query (Retrieval)
 │   ├── core/config.py           # Configuration loader (.env & defaults)
 │   ├── database/
 │   │   ├── session.py           # SQLAlchemy connection setup
 │   │   ├── models.py            # PostgreSQL Document DB model
 │   │   └── repository.py        # Database CRUD helper functions
+│   ├── retrieval/               # Retrieval Layer modules
+│   │   ├── query_classifier.py  # LLM query intent classifier
+│   │   ├── retrieval_router.py  # Routes queries to Vector or Web Search
+│   │   ├── vector_search.py     # Qdrant hybrid/vector lookup
+│   │   ├── reranker.py          # Cross-encoder MS-Marco ranker
+│   │   ├── web_search.py        # DuckDuckGo fallback query fetcher
+│   │   └── generator.py         # Response generation with LLM + context
 │   ├── services/
 │   │   ├── storage_service.py      # PDF disk storage handler
 │   │   ├── extraction_service.py   # Docling extraction & QA audit bridge
 │   │   ├── page_extraction_service.py # Gemini page-by-page extraction service
 │   │   ├── preprocessing_service.py# Layout-aware chunking service
 │   │   ├── embedding_service.py    # SentenceTransformer (BGE) vector generator
-│   │   └── qdrant_service.py       # Qdrant collection manager & vector upsert
+│   │   ├── qdrant_service.py       # Qdrant collection manager & vector upsert
+│   │   └── ingest_pipeline.py      # Core ingestion orchestrator service
 │   └── main.py                  # FastAPI application entry point
 ├── extraction/                  # Docling & Gemini parsing modules
 │   ├── gemini_client.py         # Google GenAI client utilities
@@ -174,6 +227,10 @@ QDRANT_HOST=localhost
 QDRANT_PORT=6333
 EMBEDDING_MODEL_NAME=BAAI/bge-base-en-v1.5
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# Groq API Configuration (for alternative RAG response generation)
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-specdec
 ```
 
 ### 3. Install Python Dependencies
