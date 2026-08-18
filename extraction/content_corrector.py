@@ -69,6 +69,7 @@ CHAR_REPLACEMENTS = {
     "\uf0d8": "➢",
     "\uf0e0": "✉",
     "\uf020": " ",
+    "\ufffd": "•",
 }
 
 # OCR Confusion Pair Replacements
@@ -164,6 +165,77 @@ OCR_CONFUSION_MAP = {
     r"\bDealswith\b": "Deals with",
     r"\bNew\s+Dehi\b": "New Delhi",
     r"\bnew\s+dehi\b": "new delhi",
+    # ── Enhanced Option 2: Extended IGNOU Anthropology (BANC-107/108) OCR pairs ──
+    # Additional character-substitution errors observed in anthropology courseware.
+    r"\bHominids\b": "Hominids",
+    r"\bhominds\b": "hominids",
+    r"\bpopulatoin\b": "population",
+    r"\bPopulatoin\b": "Population",
+    r"\bvariaiton\b": "variation",
+    r"\bVariaiton\b": "Variation",
+    r"\bvariaitons\b": "variations",
+    r"\bVariaitons\b": "Variations",
+    r"\banthroplogical\b": "anthropological",
+    r"\bAnthroplogical\b": "Anthropological",
+    r"\banthroplogist\b": "anthropologist",
+    r"\bAnthroplogist\b": "Anthropologist",
+    r"\banthroplogists\b": "anthropologists",
+    r"\bAnthroplogists\b": "Anthropologists",
+    r"\banthroplogic\b": "anthropologic",
+    r"\bphysicai\b": "physical",
+    r"\bPhysicai\b": "Physical",
+    r"\bbiologicai\b": "biological",
+    r"\bBiologicai\b": "Biological",
+    r"\bcuitural\b": "cultural",
+    r"\bCuitural\b": "Cultural",
+    r"\bsoicety\b": "society",
+    r"\bSoicety\b": "Society",
+    r"\bsoicetal\b": "societal",
+    r"\bSoicetal\b": "Societal",
+    r"\bkinshp\b": "kinship",
+    r"\bKinshp\b": "Kinship",
+    r"\bmarraiage\b": "marriage",
+    r"\bMarraiage\b": "Marriage",
+    r"\bmarraiages\b": "marriages",
+    r"\bdescnt\b": "descent",
+    r"\bDescnt\b": "Descent",
+    r"\blineaage\b": "lineage",
+    r"\bLineaage\b": "Lineage",
+    r"\blineaages\b": "lineages",
+    r"\btribal\s+socites\b": "tribal societies",
+    r"\bTribal\s+Socites\b": "Tribal Societies",
+    r"\bethnicty\b": "ethnicity",
+    r"\bEthnicty\b": "Ethnicity",
+    r"\bethnogarphy\b": "ethnography",
+    r"\bEthnogarphy\b": "Ethnography",
+    r"\bethnogarphic\b": "ethnographic",
+    r"\banthropoogy\b": "anthropology",
+    r"\bAnthropoogy\b": "Anthropology",
+    r"\bsocio-cultual\b": "socio-cultural",
+    r"\bSocio-Cultual\b": "Socio-Cultural",
+    r"\bsociocultual\b": "sociocultural",
+    r"\bpastoralsim\b": "pastoralism",
+    r"\bPastoralsim\b": "Pastoralism",
+    r"\bnomadsim\b": "nomadism",
+    r"\bNomadsim\b": "Nomadism",
+    r"\bpeasnatry\b": "peasantry",
+    r"\bPeasnatry\b": "Peasantry",
+    r"\bfunctionailsm\b": "functionalism",
+    r"\bFunctionailsm\b": "Functionalism",
+    r"\bstructurailsm\b": "structuralism",
+    r"\bStructurailsm\b": "Structuralism",
+    r"\bsymobl\b": "symbol",
+    r"\bSymobl\b": "Symbol",
+    r"\bsymobls\b": "symbols",
+    r"\brituai\b": "ritual",
+    r"\bRituai\b": "Ritual",
+    r"\brituais\b": "rituals",
+    r"\bsymbosim\b": "symbolism",
+    r"\bSymbosim\b": "Symbolism",
+    r"\btotemisn\b": "totemism",
+    r"\bTotemisn\b": "Totemism",
+    r"\banimisn\b": "animism",
+    r"\bAnimisn\b": "Animism",
 }
 
 # ── Issue #12: Split-word OCR join patterns ────────────────────────────────────
@@ -359,6 +431,32 @@ REPEATED_WORD_REGEX   = re.compile(r"\b([a-zA-Z]{3,})\s+\1\b", re.IGNORECASE)
 MULTIPLE_SPACES_REGEX = re.compile(r"[ \t]{2,}")
 MULTIPLE_NEWLINES_REGEX = re.compile(r"\n{3,}")
 
+# ── Enhanced Option 2: List-marker normalizer ─────────────────────────────────
+# IGNOU booklets use diverse bullet characters: arrows (➢ • > - – *) and
+# inconsistent numeral formats ("1)" vs "1." vs "(1)"). Normalise them so
+# that chunkers / embedders see consistent list syntax.
+_BULLET_NORMALIZER = re.compile(
+    r"^[ \t]*(?:[\u2022\u2023\u25e6\u2043\u25aa\u25ab\u25cf\u25cb\u2019\u27a2\u25b8\u25b9\u25ba\u25bb\u2794\u2192>\*]|\-{1,2}|\u2013|\u2014)[ \t]+",
+    re.MULTILINE,
+)
+_NUMERAL_NORMALIZER = re.compile(
+    r"^[ \t]*(\d{1,2})[\.\)\]:][ \t]+",
+    re.MULTILINE,
+)
+
+
+def _normalize_list_markers(text: str) -> str:
+    """
+    Enhanced Option 2 — Normalize diverse bullet and numeral list markers.
+
+    Converts all arrow/dash/star bullets to '• ' and normalises numeral
+    formats ("1)" / "(1)" / "1.") to "1. ".
+    """
+    text = _BULLET_NORMALIZER.sub("• ", text)
+    text = _NUMERAL_NORMALIZER.sub(lambda m: f"{m.group(1)}. ", text)
+    return text
+
+
 
 # ── 2. CONTENT CORRECTOR CLASS ────────────────────────────────────────────────
 
@@ -399,6 +497,10 @@ class ContentCorrector:
         # Rule 4b: Issue #12 — Split-word OCR joins ("V ol." -> "Vol.", "MiddleEastern" -> "Middle Eastern")
         for pattern, replacement in SPLIT_WORD_FIXES:
             corrected = pattern.sub(replacement, corrected)
+
+        # Rule 4c (Enhanced Option 2): Normalise list-bullet markers
+        # (➢, –, *, - etc.) to canonical • and numeral formats to "N. ".
+        corrected = _normalize_list_markers(corrected)
 
         # Rule 5: Remove accidental duplicate words ("the the" -> "the")
         corrected = REPEATED_WORD_REGEX.sub(r"\1", corrected)

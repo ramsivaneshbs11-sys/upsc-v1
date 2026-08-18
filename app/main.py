@@ -23,11 +23,13 @@ import os
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
 from fastapi import FastAPI
+from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
 
 from app.database.session import engine, Base
 from app.api.routes import documents
 from app.api.routes import extract_page as extract_page_v2
+from app.api.routes import query as query_route
 from app.services.qdrant_service import ensure_collections
 
 
@@ -56,20 +58,63 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI app ───────────────────────────────────────────────────────────
 app = FastAPI(
-    title="UPSC RAG — Document Ingestion API",
+    title="UPSC RAG — Document Ingestion & Retrieval API",
     description=(
-        "Two extraction endpoints for UPSC PDF documents.\n\n"
-        "**v1** — `POST /api/v1/documents` — Local Docling extraction (digital PDFs)\n"
-        "**v2** — `POST /api/v2/documents` — Gemini 2.5 Flash extraction (all PDFs)\n\n"
-        "**Pipeline (both):** Validate → Save → Register (PostgreSQL) → Extract → Preprocess + Chunk → Embed → Qdrant"
+        "## Ingestion Endpoints\n\n"
+        "### v1 — Docling Extractor (digital PDFs)\n"
+        "- `POST /api/v1/documents` — Upload **one or more** PDF files\n"
+        "- `POST /api/v1/documents/folder` — Ingest all PDFs from a **server-side folder path**\n\n"
+        "### v2 — Gemini 2.5 Flash Extractor (all PDFs)\n"
+        "- `POST /api/v2/documents` — Upload **one or more** PDF files\n"
+        "- `POST /api/v2/documents/folder` — Ingest all PDFs from a **server-side folder path**\n\n"
+        "**Pipeline per file:** Validate → Save → Register (PostgreSQL) → Extract → "
+        "Preprocess + Chunk → Embed (BGE) → Qdrant upsert\n\n"
+        "---\n\n"
+        "## Retrieval Endpoint\n\n"
+        "- `POST /api/v1/query` — Intelligent retrieval layer\n\n"
+        "**Pipeline:** Classify (Gemini Flash) → Route (High/Medium/Low confidence) → "
+        "Vector Search (Qdrant) or Web Search (DuckDuckGo) → Rerank (MiniLM) → Top-K chunks"
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
+# ── Dynamic OpenAPI Fix for Swagger UI File Uploads ──────────────────────────
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    
+    # Recursively find application/octet-stream properties and change to format: binary
+    def fix_binary_format(d):
+        if isinstance(d, dict):
+            if d.get("contentMediaType") == "application/octet-stream":
+                d["format"] = "binary"
+                del d["contentMediaType"]
+            for v in d.values():
+                fix_binary_format(v)
+        elif isinstance(d, list):
+            for v in d:
+                fix_binary_format(v)
+
+    fix_binary_format(openapi_schema)
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
 # ── Routers ───────────────────────────────────────────────────────────────
+# Ingestion
 app.include_router(documents.router)
 app.include_router(extract_page_v2.router)
+# Retrieval
+app.include_router(query_route.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────

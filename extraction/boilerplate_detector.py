@@ -144,6 +144,30 @@ WATERMARK_PATTERNS = [
     r"(?i)^\s*sample\s+only\s*$",
     r"(?i)^\s*for\s+review\s+only\s*$",
     r"(?i)^\s*not\s+for\s+sale\s*$",
+    # ── Enhanced Option 2: IGNOU partial-bleed watermark block variants ──────
+    # These fragments appear when the IGNOU background logo is only partially
+    # captured by Docling — e.g. just "PEOPLE'S" or "HE PEOPLE'S OPLE'S".
+    r"(?i)^\s*people[''']?s\s*$",
+    r"(?i)^\s*ople[''']?s\s*$",
+    r"(?i)^\s*he\s+people[''']?s\s+ople[''']?s\s*$",
+    r"(?i)^\s*he\s+people[''']?s\s*$",
+    r"(?i)^\s*university\s*$",                    # standalone "UNIVERSITY" watermark
+    r"(?i)^\s*indira\s+gandhi\s+national\s+open\s+university\s*$",
+    r"(?i)^\s*ingou\s*$",                          # OCR variant of IGNOU
+]
+
+# ── Enhanced Option 2: Inline watermark strip patterns ───────────────────────
+# These patterns match IGNOU watermark/logo text that bleeds INTO the middle
+# of legitimate paragraph text (not as a standalone block). They are used by
+# strip_inline_watermarks() to remove the contaminating phrase in-place.
+_INLINE_WATERMARK_REGEXES = [
+    re.compile(r"(?i)\s*ignou\s+the\s+people[''']?s\s+university\s*"),
+    re.compile(r"(?i)\s*the\s+people[''']?s\s+university\s*"),
+    re.compile(r"(?i)\s*he\s+people[''']?s\s+ople[''']?s\s*"),
+    re.compile(r"(?i)\s*he\s+people[''']?s\s*"),
+    re.compile(r"(?i)\s*people[''']?s\s+university\s*"),
+    re.compile(r"(?i)\s*indira\s+gandhi\s+national\s+open\s+university\s*"),
+    re.compile(r"(?i)\s*ignou\s*"),               # standalone IGNOU blob mid-sentence
 ]
 
 
@@ -293,9 +317,53 @@ class BoilerplateDetector:
         # Pass 4: Issue #2 — Reclassify ToC page-number-only footer blocks on ToC pages
         blocks = self._reclassify_toc_page_numbers(blocks)
 
+        # Pass 5 (Enhanced Option 2): Strip inline watermark bleed-through from
+        # paragraph bodies. Full-block watermarks are caught above; this pass
+        # handles the case where a watermark phrase is embedded mid-sentence.
+        blocks = self._strip_inline_watermarks(blocks)
+
         return blocks
 
     # ── PRIVATE HELPERS ───────────────────────────────────────────────────────
+
+    def _strip_inline_watermarks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Enhanced Option 2 — Strip IGNOU watermark/logo text that bleeds into
+        the interior of legitimate paragraph text blocks.
+
+        Example:
+          Before: "...due to the ignou THE PEOPLE'S UNIVERSITY growth of trade..."
+          After:  "...due to the growth of trade..."
+
+        Only non-boilerplate paragraph blocks are processed.
+        """
+        stripped_count = 0
+        for block in blocks:
+            if block.get("is_boilerplate", False):
+                continue
+            if block.get("type") not in ("paragraph", "heading", "list_item", "caption"):
+                continue
+            text = block.get("text", "")
+            if not text:
+                continue
+            original = text
+            for rx in _INLINE_WATERMARK_REGEXES:
+                text = rx.sub(" ", text)
+            # Collapse any double-spaces introduced by the removal
+            text = re.sub(r"[ \t]{2,}", " ", text).strip()
+            if text != original.strip():
+                block["text"] = text
+                block["was_corrected"] = True
+                stripped_count += 1
+                logger.debug(
+                    f"InlineWatermarkStrip: Removed watermark bleed from "
+                    f"block '{block.get('block_id')}' (page {block.get('page_num')})"
+                )
+        if stripped_count:
+            logger.info(
+                f"InlineWatermarkStrip: Stripped watermark bleed from {stripped_count} block(s)."
+            )
+        return blocks
 
     def _is_bibliography_entry(self, text: str) -> bool:
         """

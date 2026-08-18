@@ -560,7 +560,69 @@ def clean_extracted_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for idx, b in enumerate(deduped_blocks, start=1):
         b["block_id"] = f"blk_{idx:04d}"
 
-    # Pass 7: Issue 5 — Header/footer reclassification by vertical position
+    # Pass 9 (Enhanced Option 2): In-page near-duplicate block deduplication
+    # Docling sometimes emits the same block twice on the same page — once as the
+    # raw OCR text and once after its own internal correction pass.  We detect these
+    # using normalised-text Jaccard word similarity ≥ 0.85 and keep whichever copy
+    # has longer (more complete) text.
+    _DEDUP_JACCARD = 0.85
+
+    def _norm_text(t: str) -> str:
+        """Lower-case, collapse whitespace, strip punctuation for comparison."""
+        t = t.lower()
+        t = re.sub(r"[^\w\s]", "", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    dedup9_blocks: List[Dict[str, Any]] = []
+    skip_indices: Set[int] = set()
+
+    # Group block indices by page
+    _page_indices: Dict[int, List[int]] = {}
+    for _i, _b in enumerate(deduped_blocks):
+        _pn = _b.get("page_num", 0)
+        _page_indices.setdefault(_pn, []).append(_i)
+
+    for _pn, _idxs in _page_indices.items():
+        _page_blocks = [(i, deduped_blocks[i]) for i in _idxs]
+        for _ai in range(len(_page_blocks)):
+            _ia, _ba = _page_blocks[_ai]
+            if _ia in skip_indices:
+                continue
+            _ta = _norm_text(_ba.get("text", ""))
+            if len(_ta.split()) < 8:   # very short blocks are not compared
+                continue
+            _wa = set(_ta.split())
+            for _bi in range(_ai + 1, len(_page_blocks)):
+                _ib, _bb = _page_blocks[_bi]
+                if _ib in skip_indices:
+                    continue
+                _tb = _norm_text(_bb.get("text", ""))
+                if abs(len(_ta) - len(_tb)) > max(len(_ta), len(_tb)) * 0.5:
+                    continue   # lengths too different to be near-duplicates
+                _wb = set(_tb.split())
+                _union = _wa | _wb
+                if not _union:
+                    continue
+                _jaccard = len(_wa & _wb) / len(_union)
+                if _jaccard >= _DEDUP_JACCARD:
+                    # Keep the longer block; drop the shorter one
+                    if len(_ba.get("text", "")) >= len(_bb.get("text", "")):
+                        skip_indices.add(_ib)
+                    else:
+                        skip_indices.add(_ia)
+                    logger.info(
+                        f"Pass9/NearDup: page {_pn} — blocks {_ia} & {_ib} "
+                        f"have Jaccard={_jaccard:.2f}; dropping shorter duplicate."
+                    )
+                    break
+
+    if skip_indices:
+        deduped_blocks = [b for i, b in enumerate(deduped_blocks) if i not in skip_indices]
+        # Re-assign block IDs after dedup
+        for idx, b in enumerate(deduped_blocks, start=1):
+            b["block_id"] = f"blk_{idx:04d}"
+        logger.info(f"Pass9/NearDup: Removed {len(skip_indices)} near-duplicate block(s).")
+
     # Two blocks in the same horizontal band should have the same type.
     # Use bbox[1] (top-Y in Docling's inverted-Y = high value means near top of page).
     # Page height is approximated from the max Y seen across all blocks on the page.

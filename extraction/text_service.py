@@ -36,33 +36,35 @@ logger = logging.getLogger("text_service")
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 _TEXT_EXTRACTION_PROMPT = """
-You are a precise document transcription engine.
-
-Your task: Extract ALL text content from this PDF page image.
+You are a precise, layout-aware document transcription and visual structure analysis engine.
+Your task is to extract ALL non-table text and diagrams from this PDF page image.
 
 STRICT RULES:
-1. Transcribe text VERBATIM — do not summarise, paraphrase, or reword anything.
-2. Classify each block as one of: "heading", "paragraph", "list_item", or "diagram".
-3. DO NOT extract table cell text — skip any text that is inside a table grid.
-4. Preserve the reading order (top-to-bottom, left-to-right; for multi-column layouts, left column first).
-5. Mark a block as is_boilerplate=true if it is a running header, footer, or page number.
-6. If the page has no text (image-only or blank), return an empty array [].
-7. DIAGRAM RULE: If the page contains a flowchart, process diagram, mind map, decision tree,
-   or any sequential/branching visual structure, extract it as a single block of type "diagram".
-   - The "text" field must contain TWO parts, separated by the marker "---SUMMARY---":
-     PART 1: A valid Mermaid.js diagram definition enclosed in triple backticks (```mermaid ... ```).
-             Use graph TD for top-down flowcharts, graph LR for left-right, sequenceDiagram for
-             sequence diagrams, or mindmap for mind maps. Quote all node labels.
-     PART 2: A concise plain-English step-by-step summary of the flow/logic shown.
+1. VERBATIM TRANSCRIPTION: Transcribe text exactly as it appears. Do not summarize, paraphrase, correct grammar, or abbreviate.
+2. LAYOUT & READING ORDER:
+   - For single-column pages, read strictly top-to-bottom.
+   - For multi-column pages, read left-column top-to-bottom first, then right-column top-to-bottom. Do not mix text across columns.
+3. CLASSIFICATION: Classify each block into one of these type strings: "heading", "paragraph", "list_item", or "diagram".
+4. SKIP TABLES: Do not extract any text inside a table grid. Table extraction is handled separately.
+5. BOILERPLATE: Identify running headers, footers, page numbers, and copyright watermarks. Mark them with is_boilerplate=true and set type="header" or type="footer".
+6. BLANK PAGE: If the page has no text or visual diagrams, return an empty JSON array [].
+7. DIAGRAM & WORKFLOW RULE:
+   - If the page contains a flowchart, process flow, mind map, decision tree, hierarchy chart, or any visual sequential structure, extract it as a single block of type "diagram".
+   - The "text" field of a "diagram" block must contain two parts, separated by the exact delimiter "---SUMMARY---":
+     PART 1: A valid, clean Mermaid.js diagram definition enclosed in triple backticks (```mermaid ... ```).
+             - Use graph TD for top-down flowcharts, graph LR for left-to-right, sequenceDiagram for sequence flows, or mindmap for mind maps.
+             - IMPORTANT: Quote all node labels (e.g. A["Upload PDF"] instead of A[Upload PDF]) to prevent Mermaid parsing errors.
+     PART 2: A clear, step-by-step plain-English explanation of the diagram's logic, entities, and flow direction.
    - Do NOT apply the letter-spacing obfuscation to the "text" field of a "diagram" block.
    - Set is_boilerplate=false for diagrams.
    Example diagram block:
    {
      "type": "diagram",
-     "text": "```mermaid\ngraph TD\n    A[\"Upload PDF\"] --> B{\"Is it scanned?\"}\n    B -->|Yes| C[\"Gemini VLM\"]\n    B -->|No| D[\"Docling\"]\n```\n---SUMMARY---\nThe flowchart shows the smart routing decision for uploaded PDFs. First, the PDF is checked to see if it is scanned. If scanned, it is routed to Gemini VLM for vision-based extraction; otherwise it goes to Docling for text-based parsing.",
+     "text": "```mermaid\ngraph TD\n    A[\\\"Input PDF\\\"] --> B[\\\"Check Text Layer\\\"]\n    B -->|\\\"Scanned\\\"| C[\\\"VLM Extraction\\\"]\n    B -->|\\\"Digital\\\"| D[\\\"Docling\\\"]\n```\n---SUMMARY---\nThe flow diagram outlines the PDF processing route. The document goes to Gemini VLM if scanned, and Docling if it has a digital text layer.",
      "is_boilerplate": false
    }
 
+API OBFUSCATION COMPLIANCE:
 To ensure API compliance, you MUST format the value of the "text" field for heading, paragraph,
 and list_item blocks by putting a space between every letter of a word, and a slash "/" between words.
 Do NOT apply this formatting to "diagram" blocks (their text must remain valid Mermaid syntax).
@@ -76,14 +78,14 @@ Example non-diagram blocks:
   },
   {
     "type": "paragraph",
-    "text": "T h e / e a r l i e s t / c i v i l i s a t i o n s / e m e r g e d / a- / l o n g / r i v e r / v a l l e y s .",
+    "text": "T h e / e a r l i e s t / c i v i l i s a t i o n s / e m e r g e d / a - / l o n g / r i v e r / v a l l e y s .",
     "is_boilerplate": false
   }
 ]
 
 Allowed type values: "heading", "paragraph", "list_item", "diagram".
 Return ONLY the JSON array. Do not wrap in markdown code blocks.
-""".strip()
+"""        .strip()
 
 _TEXT_RETRY_PROMPT = """
 Your previous response could not be parsed as valid JSON.

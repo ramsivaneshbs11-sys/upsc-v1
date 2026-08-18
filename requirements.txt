@@ -15,8 +15,8 @@ PyMuPDF>=1.22.0
 Pillow>=9.5.0
 pytesseract>=0.3.10
 pdfplumber>=0.10.0
-rapidocr-onnxruntime>=1.3.0
-onnxruntime>=1.15.0
+# rapidocr-onnxruntime — NOT compatible with Python 3.14 (max 3.13), skip
+# onnxruntime>=1.15.0
 
 # Gemini 2.5 Flash (Endpoint 2 extraction engine)
 google-genai>=1.0.0
@@ -31,3 +31,7 @@ sentence-transformers>=3.0.0
 
 # Vector Database (Qdrant)
 qdrant-client>=1.9.0
+
+# Retrieval Layer
+duckduckgo-search>=6.0.0       # DuckDuckGo web search fallback (low-confidence queries)
+google-generativeai>=0.8.0     # Gemini Flash query classifier

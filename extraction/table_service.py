@@ -27,34 +27,22 @@ logger = logging.getLogger("table_service")
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 _TABLE_EXTRACTION_PROMPT = """
-You are a precise document table extraction engine.
-
-Your task: Extract ALL tables from this PDF page image.
+You are a highly precise document table parsing and extraction engine.
+Your task is to extract ALL structured tables and data grids from this PDF page image.
 
 STRICT RULES:
-1. Identify every table present on the page (there may be 0, 1, or more).
-2. For each table:
-   - Extract the header row as a list of column name strings.
-   - Extract all data rows — each row is a list of cell value strings.
-   - Transcribe cell values VERBATIM. Do not paraphrase or abbreviate.
-   - If a caption or title is present above/below the table, extract it.
-3. DO NOT extract any non-table text (headings, paragraphs, captions unrelated to tables).
-4. If the page has NO tables, return an empty array [].
+1. TABLE DETECTION: Locate every table present on the page (there may be 0, 1, or more).
+2. CELL TRANSCRIPTION: Transcribe cell contents exactly as they appear. Do not summarize, format numbers, or skip empty cells (use an empty string "" for empty cells).
+3. STRUCTURE:
+   - "caption": Extract any table title, index label, or note immediately above/below the table (e.g. "Table 1.1: Population Growth"). If none exists, use "".
+   - "headers": A flat list of column header strings.
+   - "rows": A list of lists, where each list contains the cell values for that row in order.
+4. EXCLUDE BODY TEXT: Ignore all paragraphs, main page headings, lists, running headers, and footers that are not part of a table.
+5. WATERMARK CLEANING: If a vertical watermark or page number runs through a cell, strip that background string out of the cell text.
+6. NO TABLES: If the page has no table grids, return an empty array [].
 
-Return ONLY a JSON array with this exact structure — no markdown fences, no extra keys:
-[
-  {
-    "caption": "Table 1: Major Dynasties",
-    "headers": ["Dynasty", "Period", "Region"],
-    "rows": [
-      ["Maurya", "322–185 BCE", "North India"],
-      ["Gupta", "320–550 CE", "North India"]
-    ]
-  }
-]
-
-If there is no caption, use an empty string "".
-If headers cannot be determined, use ["Column_1", "Column_2", ...].
+Return ONLY the raw JSON array with the exact keys: "caption" (string), "headers" (array of strings), "rows" (array of arrays of strings).
+Do not wrap in markdown code blocks. No explanations.
 """.strip()
 
 _TABLE_RETRY_PROMPT = """

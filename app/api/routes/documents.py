@@ -1,44 +1,31 @@
 """
 app/api/routes/documents.py
 ────────────────────────────
-Single FastAPI endpoint: POST /api/v1/documents
+v1 ingestion endpoints (Docling extractor).
 
-Pipeline (fully sequential, all steps block before the next starts):
+Endpoints:
+  POST /api/v1/documents               — upload one or more PDF files
+  POST /api/v1/documents/folder        — ingest all PDFs in a server-side folder path
+  POST /api/v1/documents/retry-failed  — resume all failed documents from embedding step
 
-  1.  Validate classification & file extension
-  2.  Generate UUID
-  3.  Save PDF to uploads/<classification>/<uuid>.pdf
-  4.  Register document in PostgreSQL        →  status = registered
-  5.  Update status                          →  status = extracting
-  6.  Run Docling extraction pipeline
-  7a. Success → Update status               →  status = extracted
-  7b. Failure → Update status               →  status = failed
-  8.  Update status                          →  status = preprocessing
-  8a. Run preprocessing + chunking
-  8b. Success → Update status               →  status = preprocessed
-  8c. Failure → Update status               →  status = failed
-  9.  Update status                          →  status = embedding
-  9a. Run BGE embedding
-  9b. Failure → Update status               →  status = failed
-  10. Run Qdrant upsert
-  10a. Success → Update status              →  status = ingested
-  10b. Failure → Update status              →  status = failed
-  11. Return JSON response
+Pipeline per file (fully sequential):
+  Validate → Save → Register (PostgreSQL) → Extract (Docling)
+  → Preprocess + Chunk → Embed (BGE) → Upsert (Qdrant) → Return JSON
 """
-import uuid
 import logging
-import tempfile
 from pathlib import Path
+from typing import List
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.config import ALLOWED_CLASSIFICATIONS
 from app.database.session import get_db
+from app.database.models import Document
 from app.database import repository
-from app.services.storage_service import save_uploaded_pdf
 from app.services.extraction_service import run_extraction
-from app.services.preprocessing_service import run_preprocessing
+from app.services.ingest_pipeline import run_single_ingest
 from app.services.embedding_service import run_embedding
 from app.services.qdrant_service import run_qdrant_upsert
 
@@ -47,178 +34,279 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
 
+# ── Request body for folder ingestion ─────────────────────────────────────────
+
+class FolderIngestRequest(BaseModel):
+    folder_path: str
+    classification: str
+
+
+# ── Multi-file upload endpoint ────────────────────────────────────────────────
+
 @router.post("/documents", status_code=status.HTTP_201_CREATED)
-async def register_and_extract(
-    file: UploadFile = File(..., description="PDF file to ingest"),
-    classification: str = Form(..., description="Document classification: History or Anthropology"),
+async def ingest_files(
+    files: List[UploadFile] = File(..., description="One or more PDF files to ingest"),
+    classification: str = Form(
+        ..., description="Document classification: History or Anthropology"
+    ),
     db: Session = Depends(get_db),
 ):
     """
-    Register a PDF document and run the full ingestion pipeline.
+    Upload **one or more** PDF files and run the full ingestion pipeline for each.
 
-    Pipeline steps (all sequential, same endpoint):
-    - **Validate** → **Save** → **Register** (PostgreSQL) → **Extract** (Docling)
-    - **Preprocess + Chunk** → **Embed** (BGE) → **Upsert** (Qdrant)
+    - **files**: Select one or multiple `.pdf` files (multipart/form-data)
+    - **classification**: `History` or `Anthropology`
 
-    - **file**: PDF file (multipart/form-data)
-    - **classification**: One of `History` or `Anthropology`
+    Returns a list — one result object per uploaded file.
 
-    Returns the final document record from PostgreSQL.
+    Pipeline per file: Validate → Save → Register → Extract (Docling)
+    → Preprocess → Embed → Qdrant upsert
     """
-
-    # ── Step 1: Validate inputs ───────────────────────────────────────────────
+    # ── Validate classification ───────────────────────────────────────────────
     if classification not in ALLOWED_CLASSIFICATIONS:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid classification '{classification}'. Allowed: {ALLOWED_CLASSIFICATIONS}",
         )
 
-    filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    # ── Validate that all uploads are PDFs before starting any pipeline ───────
+    for f in files:
+        filename = f.filename or ""
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{filename}' is not a PDF. Only .pdf files are accepted.",
+            )
+
+    # ── Process each file sequentially ───────────────────────────────────────
+    results = []
+    for upload in files:
+        filename = upload.filename or "unknown.pdf"
+        logger.info(f"Processing upload: {filename}")
+        pdf_bytes = await upload.read()
+        result = run_single_ingest(
+            filename=filename,
+            classification=classification,
+            pdf_bytes=pdf_bytes,
+            db=db,
+            extractor_fn=run_extraction,
+        )
+        results.append(result)
+
+    return results
+
+
+# ── Folder ingestion endpoint ─────────────────────────────────────────────────
+
+@router.post("/documents/folder", status_code=status.HTTP_201_CREATED)
+def ingest_folder(
+    body: FolderIngestRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Ingest **all PDF files** found inside a server-side folder path.
+
+    Provide the absolute path to a folder on the server that contains PDF files.
+    The endpoint will recursively discover all `*.pdf` files and run the full
+    ingestion pipeline for each one.
+
+    ```json
+    {
+      "folder_path": "C:/data/pdfs/history",
+      "classification": "History"
+    }
+    ```
+
+    Returns a list — one result object per discovered PDF.
+
+    Pipeline per file: Validate → Save → Register → Extract (Docling)
+    → Preprocess → Embed → Qdrant upsert
+    """
+    # ── Validate classification ───────────────────────────────────────────────
+    if body.classification not in ALLOWED_CLASSIFICATIONS:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are accepted. Please upload a .pdf file.",
+            detail=(
+                f"Invalid classification '{body.classification}'. "
+                f"Allowed: {ALLOWED_CLASSIFICATIONS}"
+            ),
         )
 
-    # ── Step 2: Generate UUID ─────────────────────────────────────────────────
-    file_id = str(uuid.uuid4())
-    logger.info(f"New document request → id={file_id}, file={filename}, class={classification}")
-
-    # ── Step 3: Save PDF to disk ──────────────────────────────────────────────
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(await file.read())
-            tmp_path = Path(tmp.name)
-
-        saved_path = save_uploaded_pdf(file_id, classification, tmp_path)
-        logger.info(f"[{file_id}] PDF saved → {saved_path}")
-    except Exception as exc:
-        logger.exception(f"[{file_id}] Failed to save uploaded file: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to save PDF: {exc}")
-
-    # ── Step 4: Register in PostgreSQL (status = registered) ──────────────────
-    doc = repository.create_document(
-        db=db,
-        file_id=file_id,
-        original_filename=filename,
-        classification=classification,
-        file_path=str(saved_path),
-    )
-    logger.info(f"[{file_id}] Registered in PostgreSQL — status=registered")
-
-    # ── Step 5: Update status → extracting ───────────────────────────────────
-    repository.update_document_status(db, file_id, status="extracting")
-    logger.info(f"[{file_id}] Status updated → extracting")
-
-    # ── Step 6: Run extraction ────────────────────────────────────────────────
-    success, json_path, error_msg = run_extraction(
-        file_id=file_id,
-        pdf_path=saved_path,
-    )
-
-    # ── Steps 7a / 7b: Update extraction status ───────────────────────────────
-    if not success:
-        final_doc = repository.update_document_status(
-            db,
-            file_id,
-            status="failed",
-            error_message=error_msg,
+    # ── Validate folder path ──────────────────────────────────────────────────
+    folder = Path(body.folder_path)
+    if not folder.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder not found: '{body.folder_path}'",
         )
-        logger.error(f"[{file_id}] Extraction failed → status=failed | {error_msg}")
-        return _build_response(final_doc)
-
-    final_doc = repository.update_document_status(
-        db,
-        file_id,
-        status="extracted",
-        extracted_json_path=str(json_path),
-    )
-    logger.info(f"[{file_id}] Extraction complete ✓ → status=extracted")
-
-    # ── Step 8: Preprocessing + Chunking ─────────────────────────────────────
-    repository.update_document_status(db, file_id, status="preprocessing")
-    logger.info(f"[{file_id}] Status updated → preprocessing")
-
-    pre_success, preprocessed_path, pre_error = run_preprocessing(
-        file_id=file_id,
-        extracted_json_path=json_path,
-    )
-
-    if not pre_success:
-        final_doc = repository.update_document_status(
-            db,
-            file_id,
-            status="failed",
-            error_message=pre_error,
+    if not folder.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Path is not a directory: '{body.folder_path}'",
         )
-        logger.error(f"[{file_id}] Preprocessing failed → status=failed | {pre_error}")
-        return _build_response(final_doc)
 
-    final_doc = repository.update_document_status(
-        db,
-        file_id,
-        status="preprocessed",
-        preprocessed_json_path=str(preprocessed_path),
-    )
-    logger.info(f"[{file_id}] Preprocessing complete ✓ → status=preprocessed")
-
-    # ── Step 9: Embedding ─────────────────────────────────────────────────────
-    repository.update_document_status(db, file_id, status="embedding")
-    logger.info(f"[{file_id}] Status updated → embedding")
-
-    emb_success, embedded_chunks, emb_error = run_embedding(
-        preprocessed_json_path=preprocessed_path,
-    )
-
-    if not emb_success:
-        final_doc = repository.update_document_status(
-            db,
-            file_id,
-            status="failed",
-            error_message=emb_error,
+    # ── Discover PDFs ─────────────────────────────────────────────────────────
+    pdf_files = sorted(folder.rglob("*.pdf"))
+    if not pdf_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No PDF files found in folder: '{body.folder_path}'",
         )
-        logger.error(f"[{file_id}] Embedding failed → status=failed | {emb_error}")
-        return _build_response(final_doc)
 
-    logger.info(f"[{file_id}] Embedding complete ✓ — {len(embedded_chunks)} vectors")
-
-    # ── Step 10: Qdrant Upsert ────────────────────────────────────────────────
-    qdrant_success, qdrant_error = run_qdrant_upsert(
-        file_id=file_id,
-        classification=classification,
-        embedded_chunks=embedded_chunks,
+    logger.info(
+        f"Folder ingest (v1) — found {len(pdf_files)} PDFs in '{folder}' "
+        f"| classification={body.classification}"
     )
 
-    if not qdrant_success:
-        final_doc = repository.update_document_status(
-            db,
-            file_id,
-            status="failed",
-            error_message=qdrant_error,
+    # ── Process each PDF sequentially ────────────────────────────────────────
+    results = []
+    for pdf_path in pdf_files:
+        logger.info(f"Processing PDF from folder: {pdf_path.name}")
+        try:
+            pdf_bytes = pdf_path.read_bytes()
+        except Exception as exc:
+            logger.error(f"Cannot read '{pdf_path}': {exc}")
+            results.append({
+                "document_id": None,
+                "original_filename": pdf_path.name,
+                "classification": body.classification,
+                "status": "failed",
+                "error_message": f"Cannot read file: {exc}",
+            })
+            continue
+
+        result = run_single_ingest(
+            filename=pdf_path.name,
+            classification=body.classification,
+            pdf_bytes=pdf_bytes,
+            db=db,
+            extractor_fn=run_extraction,
         )
-        logger.error(f"[{file_id}] Qdrant upsert failed → status=failed | {qdrant_error}")
-        return _build_response(final_doc)
+        results.append(result)
 
-    # ── Step 11: Mark as fully ingested ──────────────────────────────────────
-    final_doc = repository.update_document_status(db, file_id, status="ingested")
-    logger.info(f"[{file_id}] Full pipeline complete ✓ → status=ingested")
-
-    return _build_response(final_doc)
-
-
-# ── Helper ────────────────────────────────────────────────────────────────────
-
-def _build_response(doc) -> dict:
-    """Serialize a Document ORM object to a response dict."""
     return {
-        "document_id": doc.id,
-        "original_filename": doc.original_filename,
-        "classification": doc.classification,
-        "file_path": doc.file_path,
-        "extracted_json_path": doc.extracted_json_path,
-        "preprocessed_json_path": doc.preprocessed_json_path,
-        "status": doc.status,
-        "error_message": doc.error_message,
-        "created_at": doc.created_at.isoformat(),
-        "updated_at": doc.updated_at.isoformat(),
+        "folder": str(folder),
+        "classification": body.classification,
+        "total_pdfs": len(pdf_files),
+        "results": results,
+    }
+
+
+# ── Retry-failed endpoint ─────────────────────────────────────────────────────
+
+@router.post("/documents/retry-failed", status_code=status.HTTP_200_OK)
+def retry_failed_documents(
+    db: Session = Depends(get_db),
+):
+    """
+    Resume ingestion for all documents currently marked as **failed** in PostgreSQL.
+
+    For each failed document this endpoint:
+    - Checks the `preprocessed_json_path` stored in the DB record exists on disk.
+    - If it exists, **skips** extraction and preprocessing entirely.
+    - Runs **BGE embedding** directly on the preprocessed JSON.
+    - Upserts the vectors to the correct **Qdrant** collection.
+    - Updates status to `ingested` on success, or records the new error on failure.
+
+    Documents whose preprocessed JSON is missing on disk are skipped with a
+    `needs_reprocessing` status — they require a full re-ingest.
+
+    Returns a summary report with per-document results.
+    """
+    failed_docs = db.query(Document).filter(Document.status == "failed").all()
+
+    if not failed_docs:
+        return {
+            "message": "No failed documents found. Everything is clean!",
+            "recovered": 0,
+            "skipped": 0,
+            "still_failed": 0,
+            "results": [],
+        }
+
+    logger.info(f"retry-failed: Found {len(failed_docs)} failed document(s). Starting recovery...")
+
+    results = []
+    recovered = 0
+    skipped = 0
+    still_failed = 0
+
+    for doc in failed_docs:
+        entry = {
+            "document_id": doc.id,
+            "original_filename": doc.original_filename,
+            "classification": doc.classification,
+            "previous_error": doc.error_message,
+        }
+
+        # ── Guard: preprocessed JSON must exist on disk ────────────────────────
+        if not doc.preprocessed_json_path:
+            entry["status"] = "skipped"
+            entry["reason"] = "preprocessed_json_path not set in DB — full re-ingest required."
+            logger.warning(f"[{doc.id}] retry-failed: skipped — no preprocessed_json_path.")
+            results.append(entry)
+            skipped += 1
+            continue
+
+        prep_path = Path(doc.preprocessed_json_path)
+        if not prep_path.exists():
+            entry["status"] = "skipped"
+            entry["reason"] = f"Preprocessed JSON missing on disk: {prep_path.name} — full re-ingest required."
+            logger.warning(f"[{doc.id}] retry-failed: skipped — file not found: {prep_path}")
+            results.append(entry)
+            skipped += 1
+            continue
+
+        # ── Step 1: Embedding ─────────────────────────────────────────────────
+        repository.update_document_status(db, doc.id, status="embedding")
+        emb_success, embedded_chunks, emb_error = run_embedding(prep_path)
+
+        if not emb_success:
+            repository.update_document_status(db, doc.id, status="failed", error_message=emb_error)
+            entry["status"] = "failed"
+            entry["error"] = emb_error
+            logger.error(f"[{doc.id}] retry-failed: embedding failed: {emb_error}")
+            results.append(entry)
+            still_failed += 1
+            continue
+
+        # ── Step 2: Qdrant upsert ─────────────────────────────────────────────
+        qdrant_success, qdrant_error = run_qdrant_upsert(
+            file_id=doc.id,
+            classification=doc.classification,
+            embedded_chunks=embedded_chunks,
+        )
+
+        if not qdrant_success:
+            repository.update_document_status(db, doc.id, status="failed", error_message=qdrant_error)
+            entry["status"] = "failed"
+            entry["error"] = qdrant_error
+            logger.error(f"[{doc.id}] retry-failed: qdrant upsert failed: {qdrant_error}")
+            results.append(entry)
+            still_failed += 1
+            continue
+
+        # ── Success ───────────────────────────────────────────────────────────
+        repository.update_document_status(db, doc.id, status="ingested", error_message=None)
+        entry["status"] = "ingested"
+        entry["vectors_upserted"] = len(embedded_chunks)
+        logger.info(f"[{doc.id}] retry-failed: '{doc.original_filename}' recovered successfully.")
+        results.append(entry)
+        recovered += 1
+
+    logger.info(
+        f"retry-failed complete — recovered={recovered}, "
+        f"skipped={skipped}, still_failed={still_failed}"
+    )
+
+    return {
+        "message": "Retry complete.",
+        "total_failed_found": len(failed_docs),
+        "recovered": recovered,
+        "skipped": skipped,
+        "still_failed": still_failed,
+        "results": results,
     }
