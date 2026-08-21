@@ -279,13 +279,14 @@ def generate_grounded_answer(
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.0,
+                "max_tokens": 2048,
                 "response_format": {"type": "json_object"}
             }
             resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=15.0
+                timeout=60.0   # UPSC answers can be 500-1000 tokens; 15s was too short
             )
             resp.raise_for_status()
             response_json = resp.json()

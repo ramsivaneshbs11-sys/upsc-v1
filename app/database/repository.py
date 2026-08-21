@@ -53,3 +53,17 @@ def update_document_status(
 def get_document_by_id(db: Session, file_id: str) -> Document | None:
     """Return a document record by UUID, or None if not found."""
     return db.get(Document, file_id)
+
+
+def delete_document(db: Session, file_id: str) -> bool:
+    """
+    Permanently delete a document record from PostgreSQL.
+
+    Returns True if the record was found and deleted, False if not found.
+    """
+    doc = db.get(Document, file_id)
+    if doc is None:
+        return False
+    db.delete(doc)
+    db.commit()
+    return True

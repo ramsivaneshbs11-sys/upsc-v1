@@ -162,3 +162,65 @@ def run_qdrant_upsert(
         error_msg = f"Qdrant upsert failed: {exc}"
         logger.exception(f"[{file_id}] {error_msg}")
         return False, error_msg
+
+
+def delete_document_vectors(
+    file_id: str,
+    classification: str,
+) -> tuple[bool, int, str | None]:
+    """
+    Delete all Qdrant vector points belonging to a specific document.
+
+    Args:
+        file_id:        UUID of the document record.
+        classification: 'History' or 'Anthropology' — determines which collection to target.
+
+    Returns:
+        (success: bool, deleted_count: int, error_message: str | None)
+    """
+    collection_name = QDRANT_COLLECTION_MAP.get(classification)
+    if not collection_name:
+        error_msg = f"No Qdrant collection mapped for classification '{classification}'"
+        logger.error(f"[{file_id}] {error_msg}")
+        return False, 0, error_msg
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        client = get_qdrant_client()
+
+        # First count how many points exist for this file
+        count_result = client.count(
+            collection_name=collection_name,
+            count_filter=Filter(
+                must=[FieldCondition(key="file_id", match=MatchValue(value=file_id))]
+            ),
+            exact=True,
+        )
+        point_count = count_result.count
+
+        if point_count == 0:
+            logger.warning(
+                f"[{file_id}] No vectors found in '{collection_name}' — nothing to delete."
+            )
+            return True, 0, None
+
+        # Delete all matching points
+        client.delete(
+            collection_name=collection_name,
+            points_selector=Filter(
+                must=[FieldCondition(key="file_id", match=MatchValue(value=file_id))]
+            ),
+            wait=True,
+        )
+
+        logger.info(
+            f"[{file_id}] Deleted {point_count} vector(s) from "
+            f"Qdrant collection '{collection_name}' ✓"
+        )
+        return True, point_count, None
+
+    except Exception as exc:
+        error_msg = f"Qdrant delete failed: {exc}"
+        logger.exception(f"[{file_id}] {error_msg}")
+        return False, 0, error_msg

@@ -21,8 +21,8 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger("chunker")
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_MAX_CHUNK_SIZE = 1200
-DEFAULT_MIN_PAGE_SIZE  = 300
+DEFAULT_MAX_CHUNK_SIZE = 800
+DEFAULT_MIN_PAGE_SIZE  = 200
 
 
 def create_chunks(

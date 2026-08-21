@@ -21,10 +21,20 @@ Output schema:
     }
 """
 
+import json
 import logging
+import re
 import numpy as np
+import requests
+import google.generativeai as genai
 
-from app.core.config import ALLOWED_CLASSIFICATIONS
+from app.core.config import (
+    ALLOWED_CLASSIFICATIONS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+)
 from app.services.embedding_service import _get_model as get_embedding_model
 
 logger = logging.getLogger(__name__)
@@ -45,6 +55,14 @@ _SUBJECT_ANCHORS: dict[str, list[str]] = {
         "UPSC history prelims mains polity governance ancient medieval modern",
         "Archaeological findings historical monuments heritage sites inscriptions",
         "Socio-religious reform movements nationalism India freedom fighters",
+        # ── Added: Religious & cultural history topics commonly confused with Anthropology ──
+        "Buddhism Jainism Hinduism Islam Sufism Bhakti movement religious philosophy teachings",
+        "Gautama Buddha Mahavira Four Noble Truths Eightfold Path Nirvana Ahimsa Dharma",
+        "Sufi saints Bhakti saints Kabir Mirabai Guru Nanak medieval religious movements India",
+        "Indian art architecture temple cave paintings sculpture Ajanta Ellora Sanchi stupa",
+        "Salt Satyagraha Civil Disobedience Quit India Movement Dandi March Gandhi Khilafat",
+        "Non-Cooperation Movement Indian National Congress Swaraj boycott British colonial protest",
+        "Simon Commission Lahore session Purna Swaraj Gandhi Nehru Rowlatt Act Jallianwala Bagh",
     ],
     "Anthropology": [
         "Anthropology culture society kinship marriage family tribe ritual",
@@ -52,11 +70,14 @@ _SUBJECT_ANCHORS: dict[str, list[str]] = {
         "Kinship descent lineage clan moiety phratry marriage rules exogamy endogamy",
         "Tribe indigenous people scheduled tribes cultural ecology adaptation",
         "Ethnography fieldwork participant observation qualitative research",
-        "Cultural diffusion acculturation assimilation syncretism social change",
+        "Cultural diffusion acculturation assimilation sociocultural change enculturation",
         "Caste class stratification social structure inequality",
         "Fossil hominid prehistoric human evolution Neanderthal Homo sapiens",
         "Applied anthropology development tribal welfare social policy",
-        "Totemism animism religion magic ritual belief systems",
+        # ── Refined: Tribal-specific religion terms only (removed generic 'religion') ──
+        "Totemism animism tribal religion magic shamanism sorcery witchcraft ritual belief",
+        "Functionalism structuralism cultural materialism anthropological theory Boas Malinowski",
+        "Somatoscopy dermatoglyphics blood groups genetic markers human genetics physical traits",
     ],
 }
 
@@ -89,21 +110,122 @@ def _get_anchor_embeddings() -> dict[str, np.ndarray]:
     return _anchor_embeddings
 
 
+def _get_active_classifications() -> list[str]:
+    """
+    Fetch all active classifications including both hardcoded ones
+    and those registered dynamically in the PostgreSQL database.
+    """
+    classes = list(ALLOWED_CLASSIFICATIONS)
+    try:
+        from app.database.session import SessionLocal
+        from app.database.classification_models import Classification
+        db = SessionLocal()
+        try:
+            dynamic_records = db.query(Classification).all()
+            for r in dynamic_records:
+                if r.name not in classes:
+                    classes.append(r.name)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(f"Could not load dynamic classifications from DB: {exc}")
+    return classes
+
+
+def classify_query_via_groq(query: str, allowed_classes: list[str]) -> tuple[str, float, dict] | None:
+    """
+    Query classifier using Groq API only. 
+    Guarantees highly accurate UPSC routing.
+    """
+    classes_str = ", ".join([f"'{c}'" for c in allowed_classes])
+    prompt = f"""You are a query classifier for a UPSC CSE exam preparation search system.
+Your job is to classify the user's query into exactly one of these allowed categories: {classes_str}.
+
+User Query: "{query}"
+
+Respond ONLY with a JSON object. The JSON object must contain exactly three keys:
+- "classification": The chosen category name from the allowed list (exactly as spelled).
+- "confidence": A float value between 0.0 and 1.0 indicating your confidence in this decision.
+- "reasoning": A short sentence explaining why this classification fits the query.
+
+Do not wrap in markdown blocks, do not include any text before or after the JSON.
+"""
+    try:
+        raw_response = None
+        if not GROQ_API_KEY or not GROQ_API_KEY.strip():
+            raise RuntimeError("GROQ_API_KEY is not set or empty in .env")
+
+        logger.info(f"[Classifier] Calling Groq using model: {GROQ_MODEL}")
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY.strip()}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"}
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        raw_response = resp.json()["choices"][0]["message"]["content"].strip()
+
+        if not raw_response:
+            return None
+
+        # Clean markdown formatting if present
+        raw_response = re.sub(r"^```(?:json)?\s*", "", raw_response)
+        raw_response = re.sub(r"\s*```$", "", raw_response)
+
+        result = json.loads(raw_response)
+        cls = result.get("classification")
+        conf = float(result.get("confidence", 0.90))
+
+        if cls in allowed_classes:
+            # Reconstruct all_scores dictionary
+            all_scores = {}
+            for c in allowed_classes:
+                if c == cls:
+                    all_scores[c] = conf
+                else:
+                    all_scores[c] = round((1.0 - conf) / max(len(allowed_classes) - 1, 1), 4)
+            return cls, conf, all_scores
+
+    except Exception as exc:
+        logger.error(f"[Classifier] classify_query_via_groq failed: {exc}")
+    return None
+
+
 def classify_query(query: str) -> dict:
     """
-    Classify a user query using cosine similarity to subject anchor embeddings.
-
-    No API key needed — uses the locally loaded BAAI/bge-base-en-v1.5 model.
-
-    Args:
-        query: The user's search query string.
-
-    Returns:
-        dict with keys:
-            classification (str)   — predicted subject class
-            confidence (float)     — cosine similarity to top class (0.0–1.0)
-            all_scores (dict)      — cosine similarity for every class
+    Classify a user query using Groq API directly by default.
+    Falls back to the local embedding classifier if Groq is unavailable.
     """
+    active_classes = _get_active_classifications()
+
+    # ── Step 1: Direct Groq Classification ───────────────────────────────────
+    groq_res = classify_query_via_groq(query, active_classes)
+    if groq_res:
+        cls, conf, all_scores = groq_res
+        logger.info(
+            f"QueryClassifier (Groq): '{query[:60]}' → class='{cls}', "
+            f"confidence={conf:.3f}, all={all_scores}"
+        )
+        return {
+            "classification": cls,
+            "confidence":     conf,
+            "all_scores":     all_scores,
+        }
+
+    # ── Step 2: Backup Local Embedding Fallback ──────────────────────────────
+    logger.warning("QueryClassifier: Groq classification failed. Falling back to local BGE embeddings.")
     try:
         model           = get_embedding_model()
         anchor_embeddings = _get_anchor_embeddings()
@@ -117,7 +239,7 @@ def classify_query(query: str) -> dict:
 
         # Compute cosine similarity to each subject anchor
         raw_scores: dict[str, float] = {}
-        for subject in ALLOWED_CLASSIFICATIONS:
+        for subject in active_classes:
             if subject in anchor_embeddings:
                 sim = float(np.dot(query_vec, anchor_embeddings[subject]))
                 raw_scores[subject] = sim
@@ -125,13 +247,10 @@ def classify_query(query: str) -> dict:
         if not raw_scores:
             raise ValueError("No anchor embeddings available.")
 
-        # Convert raw cosine similarities to a probability-like distribution
-        # using softmax so scores sum to ~1.0
+        # Softmax with temperature=10
         subjects = list(raw_scores.keys())
         sims     = np.array([raw_scores[s] for s in subjects])
-
-        # Softmax with temperature=5 (sharpens the distribution)
-        temp     = 5.0
+        temp     = 10.0
         exp_sims = np.exp(temp * (sims - sims.max()))
         probs    = exp_sims / exp_sims.sum()
 
@@ -140,7 +259,7 @@ def classify_query(query: str) -> dict:
         top_confidence = all_scores[top_subject]
 
         logger.info(
-            f"QueryClassifier: '{query[:60]}' → class='{top_subject}', "
+            f"QueryClassifier (Local Backup): '{query[:60]}' → class='{top_subject}', "
             f"confidence={top_confidence:.3f}, all={all_scores}"
         )
 
@@ -152,11 +271,11 @@ def classify_query(query: str) -> dict:
 
     except Exception as exc:
         logger.exception(
-            f"QueryClassifier failed — returning uniform distribution. Error: {exc}"
+            f"QueryClassifier backup failed — returning uniform distribution. Error: {exc}"
         )
-        uniform = round(1.0 / max(len(ALLOWED_CLASSIFICATIONS), 1), 4)
+        uniform = round(1.0 / max(len(active_classes), 1), 4)
         return {
-            "classification": ALLOWED_CLASSIFICATIONS[0],
+            "classification": active_classes[0],
             "confidence":     uniform,
-            "all_scores":     {c: uniform for c in ALLOWED_CLASSIFICATIONS},
+            "all_scores":     {c: uniform for c in active_classes},
         }

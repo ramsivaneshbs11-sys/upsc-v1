@@ -35,6 +35,7 @@ Response:
         "citations":         ["chk_0012"],
         "gated":             false,
         "gate_reason":       null,
+        "log_info":          "Query routed strictly to Anthropology Database (92.0% confidence). 20 candidate chunks retrieved and reranked. Answer backed by 1 source(s).",
         "chunks":            [ { ... } ]
     }
 """
@@ -107,6 +108,8 @@ class QueryResponse(BaseModel):
     rich_citations:   list[CitationResult]  # Human-readable: doc name + page + preview
     gated:            bool          # True = score gate blocked LLM
     gate_reason:      Optional[str] # Why gate triggered (or None)
+    # ── User-facing transparency log ─────────────────────────────────────────────────────────
+    log_info:         str           # Human-readable confirmation of which DB was searched
     # ── Retrieved evidence ───────────────────────────────────────────────────────────────────────
     chunks:           list[ChunkResult]
 
@@ -200,16 +203,58 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
         for c in chunks
     ]
 
+    # ── Build user-facing log_info message ────────────────────────────────────
+    classification  = classifier_result["classification"]
+    confidence_pct  = classifier_result["confidence"] * 100
+    citation_count  = len(generation["citations"])
+    candidate_count = len(candidates)
+
+    if routing == "high_confidence":
+        log_info = (
+            f"Query routed strictly to {classification} Database "
+            f"({confidence_pct:.1f}% confidence). "
+            f"{candidate_count} candidate chunks retrieved and reranked. "
+            f"Answer backed by {citation_count} source(s). "
+            f"No other database was searched."
+        )
+    elif routing == "medium_confidence":
+        log_info = (
+            f"Medium confidence ({confidence_pct:.1f}%) — Both History and Anthropology "
+            f"databases were searched and merged. "
+            f"{candidate_count} total candidates reranked. "
+            f"Answer backed by {citation_count} source(s)."
+        )
+    elif routing == "low_confidence":
+        log_info = (
+            f"Low confidence ({confidence_pct:.1f}%) — Query did not match local databases. "
+            f"Routed to global web search (DuckDuckGo). "
+            f"{candidate_count} web results retrieved."
+        )
+    else:
+        log_info = (
+            f"Routing: {routing} | Confidence: {confidence_pct:.1f}% | "
+            f"Candidates: {candidate_count} | Citations: {citation_count}"
+        )
+
+    # Append gate/answer status to log_info
+    if generation["gated"]:
+        log_info += f" [GATED: {generation.get('gate_reason', 'Low relevance score')}]"
+    elif not generation["answered"]:
+        log_info += " [Result: Insufficient information in knowledge base.]"
+    else:
+        log_info += " [Result: Answer successfully generated.]"
+
     logger.info(
-        f"[QUERY] Complete — class='{classifier_result['classification']}', "
+        f"[QUERY] Complete — class='{classification}', "
         f"conf={classifier_result['confidence']:.2f}, routing='{routing}', "
         f"answered={generation['answered']}, gated={generation['gated']}, "
         f"candidates={len(candidates)}, chunks={len(chunk_results)}"
     )
+    logger.info(f"[LOG_INFO] {log_info}")
 
     return QueryResponse(
         query=            query,
-        classification=   classifier_result["classification"],
+        classification=   classification,
         confidence=       classifier_result["confidence"],
         all_scores=       classifier_result.get("all_scores", {}),
         routing=          routing,
@@ -222,5 +267,6 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
         ],
         gated=            generation["gated"],
         gate_reason=      generation.get("gate_reason"),
+        log_info=         log_info,
         chunks=           chunk_results,
     )

@@ -27,9 +27,11 @@ from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
 
 from app.database.session import engine, Base
+from app.database import classification_models  # noqa: F401 — registers Classification table with Base
 from app.api.routes import documents
 from app.api.routes import extract_page as extract_page_v2
 from app.api.routes import query as query_route
+from app.api.routes import classifications as classification_route  # NEW — dynamic classification management
 from app.services.qdrant_service import ensure_collections
 
 
@@ -115,6 +117,8 @@ app.include_router(documents.router)
 app.include_router(extract_page_v2.router)
 # Retrieval
 app.include_router(query_route.router)
+# Classification Management (NEW — dynamic classification registration)
+app.include_router(classification_route.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────

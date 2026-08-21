@@ -13,6 +13,7 @@ Pipeline per file (fully sequential):
   → Preprocess + Chunk → Embed (BGE) → Upsert (Qdrant) → Return JSON
 """
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import List
 
@@ -27,18 +28,23 @@ from app.database import repository
 from app.services.extraction_service import run_extraction
 from app.services.ingest_pipeline import run_single_ingest
 from app.services.embedding_service import run_embedding
-from app.services.qdrant_service import run_qdrant_upsert
+from app.services.qdrant_service import run_qdrant_upsert, delete_document_vectors
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
 
+class ClassificationEnum(str, Enum):
+    HISTORY = "History"
+    ANTHROPOLOGY = "Anthropology"
+
+
 # ── Request body for folder ingestion ─────────────────────────────────────────
 
 class FolderIngestRequest(BaseModel):
     folder_path: str
-    classification: str
+    classification: ClassificationEnum
 
 
 # ── Multi-file upload endpoint ────────────────────────────────────────────────
@@ -46,7 +52,7 @@ class FolderIngestRequest(BaseModel):
 @router.post("/documents", status_code=status.HTTP_201_CREATED)
 async def ingest_files(
     files: List[UploadFile] = File(..., description="One or more PDF files to ingest"),
-    classification: str = Form(
+    classification: ClassificationEnum = Form(
         ..., description="Document classification: History or Anthropology"
     ),
     db: Session = Depends(get_db),
@@ -195,6 +201,50 @@ def ingest_folder(
     }
 
 
+# ── List documents endpoint ──────────────────────────────────────────────────
+
+@router.get("/documents", status_code=status.HTTP_200_OK)
+def list_documents(
+    classification: str | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    List all documents tracked in the PostgreSQL database.
+
+    Allows filtering by:
+    - **classification**: e.g., "History", "Anthropology"
+    - **status**: e.g., "ingested", "failed", "registered"
+
+    Use this endpoint to **find the UUID (`file_id`)** of a specific document
+    (like `Satyagraha.pdf`) so you can copy and pass it to the delete API.
+    """
+    query = db.query(Document)
+
+    if classification:
+        query = query.filter(Document.classification == classification)
+    if status:
+        query = query.filter(Document.status == status)
+
+    docs = query.order_by(Document.created_at.desc()).all()
+
+    return {
+        "total": len(docs),
+        "documents": [
+            {
+                "file_id": doc.id,
+                "original_filename": doc.original_filename,
+                "classification": doc.classification,
+                "status": doc.status,
+                "error_message": doc.error_message,
+                "created_at": doc.created_at.isoformat(),
+                "updated_at": doc.updated_at.isoformat(),
+            }
+            for doc in docs
+        ],
+    }
+
+
 # ── Retry-failed endpoint ─────────────────────────────────────────────────────
 
 @router.post("/documents/retry-failed", status_code=status.HTTP_200_OK)
@@ -309,4 +359,130 @@ def retry_failed_documents(
         "skipped": skipped,
         "still_failed": still_failed,
         "results": results,
+    }
+
+
+# ── Delete document endpoint ────────────────────────────────────────────────
+
+@router.delete("/documents/{document_id}", status_code=status.HTTP_200_OK)
+def delete_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete a document and all its associated data.
+
+    Cleans up all 4 storage layers in order:
+    1. **Qdrant vectors** — removes all embedded vector points for this document
+    2. **PostgreSQL record** — removes the document metadata row
+    3. **Uploaded PDF file** — deletes the original PDF from the uploads directory
+    4. **Extracted JSON** — deletes the Docling extraction output file
+    5. **Preprocessed JSON** — deletes the chunked/preprocessed file
+
+    Use this when the syllabus is updated and old content needs to be removed
+    before uploading the revised version.
+
+    - **document_id**: The UUID of the document (from `GET /api/v1/documents` or DB)
+    """
+    # ── Step 0: Look up the document in PostgreSQL ─────────────────────────
+    doc = repository.get_document_by_id(db, document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{document_id}' not found in the database."
+        )
+
+    logger.info(
+        f"[DELETE] Starting deletion of document '{doc.original_filename}' "
+        f"(id={document_id}, classification={doc.classification})"
+    )
+
+    report = {
+        "document_id":        document_id,
+        "original_filename":  doc.original_filename,
+        "classification":     doc.classification,
+        "qdrant_vectors_deleted":  0,
+        "postgres_record_deleted": False,
+        "pdf_file_deleted":        False,
+        "extracted_json_deleted":  False,
+        "preprocessed_json_deleted": False,
+        "warnings": [],
+    }
+
+    # ── Step 1: Delete vectors from Qdrant ─────────────────────────────
+    qdrant_ok, deleted_count, qdrant_err = delete_document_vectors(
+        file_id=document_id,
+        classification=doc.classification,
+    )
+    if qdrant_ok:
+        report["qdrant_vectors_deleted"] = deleted_count
+        logger.info(f"[DELETE] Qdrant: {deleted_count} vector(s) deleted.")
+    else:
+        warn_msg = f"Qdrant deletion failed: {qdrant_err}"
+        report["warnings"].append(warn_msg)
+        logger.warning(f"[DELETE] {warn_msg}")
+
+    # ── Step 2: Delete record from PostgreSQL ───────────────────────────
+    # Save file paths before deleting record (we need them for disk cleanup)
+    pdf_path             = Path(doc.file_path)                if doc.file_path             else None
+    extracted_json_path  = Path(doc.extracted_json_path)     if doc.extracted_json_path  else None
+    preprocessed_json_path = Path(doc.preprocessed_json_path) if doc.preprocessed_json_path else None
+
+    db_deleted = repository.delete_document(db, document_id)
+    report["postgres_record_deleted"] = db_deleted
+    if db_deleted:
+        logger.info(f"[DELETE] PostgreSQL record removed.")
+    else:
+        report["warnings"].append("PostgreSQL record was not found or could not be deleted.")
+
+    # ── Step 3: Delete uploaded PDF from disk ──────────────────────────
+    if pdf_path and pdf_path.exists():
+        try:
+            pdf_path.unlink()
+            report["pdf_file_deleted"] = True
+            logger.info(f"[DELETE] PDF file deleted: {pdf_path}")
+        except Exception as exc:
+            warn_msg = f"Could not delete PDF file '{pdf_path}': {exc}"
+            report["warnings"].append(warn_msg)
+            logger.warning(f"[DELETE] {warn_msg}")
+    else:
+        report["warnings"].append(f"PDF file not found on disk (path: {pdf_path}) — skipped.")
+
+    # ── Step 4: Delete extracted JSON ─────────────────────────────────
+    if extracted_json_path and extracted_json_path.exists():
+        try:
+            extracted_json_path.unlink()
+            report["extracted_json_deleted"] = True
+            logger.info(f"[DELETE] Extracted JSON deleted: {extracted_json_path}")
+        except Exception as exc:
+            warn_msg = f"Could not delete extracted JSON '{extracted_json_path}': {exc}"
+            report["warnings"].append(warn_msg)
+            logger.warning(f"[DELETE] {warn_msg}")
+    else:
+        report["warnings"].append("Extracted JSON not found on disk — skipped.")
+
+    # ── Step 5: Delete preprocessed JSON ───────────────────────────────
+    if preprocessed_json_path and preprocessed_json_path.exists():
+        try:
+            preprocessed_json_path.unlink()
+            report["preprocessed_json_deleted"] = True
+            logger.info(f"[DELETE] Preprocessed JSON deleted: {preprocessed_json_path}")
+        except Exception as exc:
+            warn_msg = f"Could not delete preprocessed JSON '{preprocessed_json_path}': {exc}"
+            report["warnings"].append(warn_msg)
+            logger.warning(f"[DELETE] {warn_msg}")
+    else:
+        report["warnings"].append("Preprocessed JSON not found on disk — skipped.")
+
+    logger.info(
+        f"[DELETE] Complete — document '{doc.original_filename}' fully purged. "
+        f"Qdrant vectors: {report['qdrant_vectors_deleted']}, "
+        f"DB: {report['postgres_record_deleted']}, "
+        f"PDF: {report['pdf_file_deleted']}, "
+        f"Warnings: {len(report['warnings'])}"
+    )
+
+    return {
+        "message": f"Document '{doc.original_filename}' has been permanently deleted.",
+        **report,
     }

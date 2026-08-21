@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # daily/
 
 # Load environment variables from the .env file
-load_dotenv(BASE_DIR / ".env")  # reload configuration for reverted settings
+load_dotenv(BASE_DIR / ".env")  # reload configuration for Groq API activation
 
 # ── PostgreSQL connection ──────────────────────────────────────────────────
 # Set this as an environment variable or create a .env file.
@@ -46,7 +46,7 @@ GEMINI_MODEL:   str = "gemini-3.5-flash"
 
 # ── Groq API (Alternative Generation Layer) ──────────────────────────────────────
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL:   str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-specdec")
+GROQ_MODEL:   str = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")  # verified available on this key
 
 # ── Retrieval Layer ────────────────────────────────────────────────────────────
 # Confidence thresholds for routing (see retrieval_layer_query_classification.md)
@@ -54,11 +54,11 @@ HIGH_CONFIDENCE_THRESHOLD: float = float(os.environ.get("HIGH_CONFIDENCE_THRESHO
 LOW_CONFIDENCE_THRESHOLD:  float = float(os.environ.get("LOW_CONFIDENCE_THRESHOLD",  "0.50"))
 
 # Number of candidate chunks sent to the reranker (first-stage retrieval)
-RETRIEVAL_CANDIDATE_K: int = int(os.environ.get("RETRIEVAL_CANDIDATE_K", "20"))
+RETRIEVAL_CANDIDATE_K: int = int(os.environ.get("RETRIEVAL_CANDIDATE_K", "10"))
 # Number of final chunks returned after reranking (second-stage)
 RETRIEVAL_FINAL_TOP_K: int = int(os.environ.get("RETRIEVAL_FINAL_TOP_K", "5"))
 
-# Cross-encoder model for reranking
+# Cross-encoder model for reranking (MiniLM-L-6-v2 is used for fast CPU retrieval)
 RERANKER_MODEL_NAME: str = os.environ.get(
     "RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )

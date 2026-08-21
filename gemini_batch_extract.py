@@ -434,8 +434,8 @@ def main():
     parser.add_argument(
         "--delay",
         type=float,
-        default=2.0,
-        help="Seconds to sleep between pages (default 2.0).",
+        default=4.0,
+        help="Seconds to sleep between pages (default 4.0).",
     )
 
     args     = parser.parse_args()
