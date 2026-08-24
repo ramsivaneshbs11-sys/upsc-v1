@@ -1,10 +1,11 @@
 import sys
 import json
 import re
+import os
+import requests
 from pathlib import Path
 import fitz
 import numpy as np
-from collections import Counter
 
 # Add project root to sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -16,103 +17,59 @@ try:
 except ImportError:
     RAPID_OCR_AVAILABLE = False
 
+from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from gemini_batch_extract import consolidate_extracted_json
 
-def build_dictionary_from_book():
-    """Builds a vocabulary of valid words directly from the other successfully parsed pages of the book."""
-    dir_path = Path("output/TRIBES INDIA")
-    word_counts = Counter()
+def call_groq_clean(text: str) -> str:
+    """Uses Groq API to fix spacing and split run-together words in the paragraph."""
+    if not text:
+        return ""
     
-    if not dir_path.exists():
-        return set()
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        print("[WARNING] GROQ_API_KEY not found in env, returning raw text.")
+        return text
         
-    for f in dir_path.glob("page_*.json"):
-        # Skip the pages we know are blank or newly OCR'd
-        page_num = int(f.stem.split("_")[1])
-        if page_num in [10, 12, 13, 14, 15, 16, 17, 18, 50, 51, 82, 83, 84, 191, 196, 198, 199, 200, 205, 206, 240, 263, 281, 290]:
-            continue
-            
-        try:
-            with open(f, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                for block in data.get("text_blocks", []):
-                    text = block.get("text", "")
-                    words = re.findall(r"\b[a-zA-Z]{2,}\b", text.lower())
-                    word_counts.update(words)
-        except Exception:
-            pass
-            
-    dictionary = set(word_counts.keys())
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     
-    # Common short words
-    dictionary.update([
-        "a", "an", "the", "in", "on", "at", "to", "of", "and", "or", "is", "was", "for", "by", "as", 
-        "it", "he", "she", "they", "we", "us", "him", "her", "his", "their", "them", "who", "whom", 
-        "its", "our", "you", "your"
-    ])
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
     
-    # Common UPSC History/Anthropology keywords
-    COMMON_UPSC_KEYWORDS = [
-        "indus", "harappa", "harappan", "munda", "naga", "nagas", "tribal", "india", "today", "british", "colonial", 
-        "ryotwari", "zamindari", "revolt", "struggle", "independence", "anthropology", "anthropologist", "culture", 
-        "racial", "origin", "prehistoric", "history", "civilization", "archaeological", "palaeontological", "mohenjodaro", 
-        "aryans", "aryan", "rigvedic", "dasas", "dasyus", "asuras", "hinduism", "sanskrit", "brahmin", "caste", "castes", 
-        "chandalas", "buddha", "ashoka", "maurya", "gupta", "mughal", "delhi", "sultanate", "gandhi", "nehru", "congress", 
-        "national", "movement", "santhal", "oraon", "gond", "bhil", "todas", "khasi", "garo", "jaintia", "kuki", "chenchu", 
-        "kadmbari", "panchatantra", "puran", "vedic", "ramayan", "mahabharat", "elwin", "ghurye", "srinivas", "dube", 
-        "majumdar", "bose", "guha", "risley"
-    ]
-    dictionary.update(COMMON_UPSC_KEYWORDS)
+    prompt = (
+        "The following text is extracted from a scanned PDF by OCR. It has run-together words, missing spaces, "
+        "or minor spelling issues. Clean and format the text into proper, natural English sentences.\n"
+        "RULES:\n"
+        "1. Do NOT add any new information, comments, or annotations.\n"
+        "2. Do NOT change the meaning or remove any technical/proper nouns.\n"
+        "3. Output ONLY the cleaned text, nothing else.\n\n"
+        f"Text:\n{text}"
+    )
     
-    return dictionary
-
-def split_run_together_word(s: str, word_set: set) -> str:
-    """Dynamic programming dynamic segmenter to split run-together words."""
-    if s.lower() in word_set:
-        return s
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0
+    }
+    
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15.0
+        )
+        if resp.status_code == 200:
+            result = resp.json()["choices"][0]["message"]["content"].strip()
+            if result:
+                return result
+    except Exception as e:
+        print(f"[ERROR] Groq API call failed: {e}")
         
-    memo = {}
-    
-    def solve(sub):
-        if not sub:
-            return []
-        if sub in memo:
-            return memo[sub]
-            
-        best = None
-        for i in range(1, len(sub) + 1):
-            prefix = sub[:i]
-            if prefix in word_set or (len(prefix) == 1 and prefix in ["a", "i"]):
-                suffix_splits = solve(sub[i:])
-                if suffix_splits is not None:
-                    cand = [prefix] + suffix_splits
-                    if best is None or len(cand) < len(best):
-                        best = cand
-        memo[sub] = best
-        return best
-
-    splits = solve(s.lower())
-    if splits:
-        return " ".join(splits)
-    return s
-
-def clean_sentence_locally(sentence: str, word_set: set) -> str:
-    """Tokenizes a sentence and fixes any run-together words locally."""
-    tokens = sentence.split()
-    cleaned_tokens = []
-    for token in tokens:
-        clean_match = re.match(r"^([^\w]*)(.*?)([^\w]*)$", token)
-        if clean_match:
-            prefix, word, suffix = clean_match.groups()
-            if len(word) > 7 and not word.lower() in word_set:
-                split_word = split_run_together_word(word, word_set)
-                cleaned_tokens.append(f"{prefix}{split_word}{suffix}")
-            else:
-                cleaned_tokens.append(token)
-        else:
-            cleaned_tokens.append(token)
-            
-    return " ".join(cleaned_tokens)
+    return text
 
 def extract_missing_pages():
     if not RAPID_OCR_AVAILABLE:
@@ -128,17 +85,13 @@ def extract_missing_pages():
         return
 
     missing_pages = [10, 12, 13, 14, 15, 16, 17, 18, 50, 51, 82, 83, 84, 191, 196, 198, 199, 200, 205, 206, 240, 263, 281, 290]
-    
-    print("Building dictionary from other book pages...")
-    word_set = build_dictionary_from_book()
-    print(f"Dictionary ready with {len(word_set)} words.")
-    
-    print(f"Starting Local Column-Aware RapidOCR extraction with Local Word Segmentation for pages: {missing_pages}")
+    print(f"Starting Local Column-Aware RapidOCR extraction with LLM Cleanup for pages: {missing_pages}")
 
     ocr_engine = RapidOCR()
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
 
+    # Patterns to ignore (watermarks, footers, headers)
     ignore_patterns = [
         re.compile(r"upscpdf", re.IGNORECASE),
         re.compile(r"download all form", re.IGNORECASE),
@@ -154,6 +107,8 @@ def extract_missing_pages():
         # Render page at 150 DPI for OCR
         pix = page.get_pixmap(dpi=150)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        
+        # Use raw RGB image directly
         img_for_ocr = img
 
         res, _ = ocr_engine(img_for_ocr)
@@ -173,12 +128,15 @@ def extract_missing_pages():
                 if not line_text:
                     continue
                 
+                # Check ignore patterns (watermarks / boilerplate headers)
                 if any(pat.search(line_text) for pat in ignore_patterns):
                     continue
                     
+                # Calculate box center
                 xc = (box[0][0] + box[1][0] + box[2][0] + box[3][0]) / 4.0
                 yc = (box[0][1] + box[1][1] + box[2][1] + box[3][1]) / 4.0
                 
+                # Categorize based on coordinate limits
                 if yc < ph * 0.08:
                     headers.append(line_text)
                 elif yc > ph * 0.92:
@@ -188,16 +146,22 @@ def extract_missing_pages():
                 else:
                     col2.append((yc, line_text))
             
+            # Sort the column lines vertically (top to bottom)
             col1.sort(key=lambda x: x[0])
             col2.sort(key=lambda x: x[0])
             
-            # Group text and clean spacing issues locally
+            # Group left page and right page text into separate paragraphs
             left_para = " ".join([text for yc, text in col1]).strip()
             right_para = " ".join([text for yc, text in col2]).strip()
             
-            left_para = clean_sentence_locally(left_para, word_set)
-            right_para = clean_sentence_locally(right_para, word_set)
+            # Clean paragraphs using Groq LLM
+            print(f" (Cleaning Left... ", end="", flush=True)
+            left_para = call_groq_clean(left_para)
+            print("Right... ", end="", flush=True)
+            right_para = call_groq_clean(right_para)
+            print("done) ", end="", flush=True)
             
+            # Format as text blocks
             for h in headers:
                 text_blocks.append({"type": "heading", "text": h})
             if left_para:
