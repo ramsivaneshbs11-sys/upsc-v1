@@ -63,9 +63,79 @@ RERANKER_MODEL_NAME: str = os.environ.get(
     "RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
 
-# Ensure directories exist on startup
+# ── Article Cache (for Current Affairs web scraping) ─────────────────────────
+# Backend: "memory" (LRU, zero-dep), "sqlite" (persistent), or "redis" (networked)
+ARTICLE_CACHE_BACKEND: str = os.environ.get("ARTICLE_CACHE_BACKEND", "memory")
+# Max articles stored in-memory (only used when ARTICLE_CACHE_BACKEND="memory")
+ARTICLE_CACHE_MAXSIZE: int = int(os.environ.get("ARTICLE_CACHE_MAXSIZE", "200"))
+# Article cache TTL in seconds (6 hours default); used by sqlite & redis backends
+ARTICLE_CACHE_TTL_SECONDS: int = int(os.environ.get("ARTICLE_CACHE_TTL_SECONDS", "21600"))
+# Path to the SQLite cache DB file (only used when ARTICLE_CACHE_BACKEND="sqlite")
+ARTICLE_CACHE_SQLITE_PATH: str = os.environ.get(
+    "ARTICLE_CACHE_SQLITE_PATH",
+    str(BASE_DIR / "data" / "article_cache.db"),
+)
+
+# ── Response Cache (for full RAG pipeline responses) ──────────────────────────
+# Master on/off switch. Set RESPONSE_CACHE_ENABLED=false in .env to disable.
+RESPONSE_CACHE_ENABLED: bool = (
+    os.environ.get("RESPONSE_CACHE_ENABLED", "true").lower() == "true"
+)
+# TTL in seconds before a cached response expires. Default: 7 days.
+RESPONSE_CACHE_TTL_SECONDS: int = int(
+    os.environ.get("RESPONSE_CACHE_TTL_SECONDS", str(7 * 24 * 3600))
+)
+# Maximum number of entries kept in the cache (LRU eviction when exceeded).
+RESPONSE_CACHE_MAXSIZE: int = int(os.environ.get("RESPONSE_CACHE_MAXSIZE", "1000"))
+# Path to the SQLite DB file for the response cache.
+RESPONSE_CACHE_SQLITE_PATH: Path = Path(
+    os.environ.get(
+        "RESPONSE_CACHE_SQLITE_PATH",
+        str(BASE_DIR / "data" / "response_cache.db"),
+    )
+)
+
+# ── Parallel Search ────────────────────────────────────────────────────────────
+# Number of concurrent workers for parallel DuckDuckGo + SearXNG search calls
+SEARCH_WORKER_COUNT: int = int(os.environ.get("SEARCH_WORKER_COUNT", "4"))
+# Comma-separated trusted site domains used for UPSC current-affairs filtering
+TRUSTED_SITES: list[str] = [
+    s.strip()
+    for s in os.environ.get(
+        "TRUSTED_SITES",
+        # ── Government & Legislative ──────────────────────────────────────────
+        "pib.gov.in,prsindia.org,gov.in,nic.in,"
+        # ── UPSC Coaching Portals ─────────────────────────────────────────────
+        "insightsias.com,civilsdaily.com,iasbaba.com,drishtiias.com,"
+        "vajiramandravi.com,clearias.com,byjus.com,gktoday.in,"
+        "unacademy.com,jagranjosh.com,"
+        # ── Reputable Indian News (added for current affairs freshness) ───────
+        "thehindu.com,indianexpress.com,livemint.com,businessstandard.com,"
+        "ndtv.com,timesofindia.indiatimes.com,thewire.in,scroll.in,"
+        # ── Reference ─────────────────────────────────────────────────────────
+        "wikipedia.org",
+    ).split(",")
+    if s.strip()
+]
+# Max results to fetch from each search provider per query
+SEARCH_MAX_RESULTS: int = int(os.environ.get("SEARCH_MAX_RESULTS", "15"))
+# SearXNG public instance URL (can be overridden with self-hosted instance)
+SEARXNG_URL: str = os.environ.get("SEARXNG_URL", "https://searx.be/search")
+
+# ── Observability ─────────────────────────────────────────────────────────────
+# When True, logs per-stage latency (search / scrape / rerank / gen) to console
+ENABLE_DETAILED_LOGGING: bool = (
+    os.environ.get("ENABLE_DETAILED_LOGGING", "false").lower() == "true"
+)
+# Directory for CSV metrics output
+METRICS_DIR: Path = BASE_DIR / "metrics"
+
+# ── Ensure directories exist on startup
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 (UPLOAD_DIR / "history").mkdir(parents=True, exist_ok=True)
 (UPLOAD_DIR / "anthropology").mkdir(parents=True, exist_ok=True)
 EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
 PREPROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+METRICS_DIR.mkdir(parents=True, exist_ok=True)
+(BASE_DIR / "data").mkdir(parents=True, exist_ok=True)  # for response_cache.db

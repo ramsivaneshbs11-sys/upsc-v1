@@ -138,17 +138,23 @@ def classify_query_via_groq(query: str, allowed_classes: list[str]) -> tuple[str
     Guarantees highly accurate UPSC routing.
     """
     classes_str = ", ".join([f"'{c}'" for c in allowed_classes])
-    prompt = f"""You are a query classifier for a UPSC CSE exam preparation search system.
-Your job is to classify the user's query into exactly one of these allowed categories: {classes_str}.
+    prompt = f"""You are an expert UPSC subject classifier. Your ONLY job is to route the user's query to the correct subject category from this list: {classes_str}.
+
+CRITICAL RULES:
+1. CASE INSENSITIVE: Treat the query as case-insensitive. "netting robert mcc", "Netting Robert McC", and "NETTING ROBERT MCC" all refer to the same person. Names in lowercase are still proper names of people/places/concepts.
+2. PROPER NOUN DETECTION: Even if names or terms are written in lowercase, recognize them as the real anthropologists, historians, rulers, or concepts they refer to (e.g., "robert mcc netting" = anthropologist Robert McC. Netting → classify as Anthropology).
+3. SUBJECT EXPERTISE: Use your deep knowledge of UPSC syllabus to classify correctly:
+   - Anthropology: Human evolution, kinship, marriage, tribe, ethnography, cultural ecology, social structure, physical anthropology, applied anthropology, famous anthropologists (Netting, Boas, Malinowski, Morgan, Radcliffe-Brown, etc.)
+   - History: Ancient/Medieval/Modern Indian history, freedom struggle, world history, dynasties, battles, monuments, socio-religious movements, Gandhi, Nehru, colonial era
+4. CONFIDENCE: Be bold — assign high confidence (0.90+) when the subject is clear. Only assign low confidence when the query is genuinely ambiguous between two subjects.
+5. OUTPUT: Respond ONLY with a raw JSON object, no markdown fences, no extra text.
 
 User Query: "{query}"
 
-Respond ONLY with a JSON object. The JSON object must contain exactly three keys:
-- "classification": The chosen category name from the allowed list (exactly as spelled).
-- "confidence": A float value between 0.0 and 1.0 indicating your confidence in this decision.
-- "reasoning": A short sentence explaining why this classification fits the query.
-
-Do not wrap in markdown blocks, do not include any text before or after the JSON.
+JSON Output (exactly three keys):
+- "classification": The chosen category name from the allowed list (spelled exactly as shown).
+- "confidence": Float between 0.0 and 1.0.
+- "reasoning": One sentence explaining why this category is correct.
 """
     try:
         raw_response = None

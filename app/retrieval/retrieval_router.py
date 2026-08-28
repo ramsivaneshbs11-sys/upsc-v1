@@ -24,10 +24,12 @@ from app.core.config import (
     LOW_CONFIDENCE_THRESHOLD,
     RETRIEVAL_CANDIDATE_K,
     RETRIEVAL_FINAL_TOP_K,
+    PREPROCESSED_DIR,
 )
-from app.retrieval.vector_search import search_collections
-from app.retrieval.web_search    import web_search
-from app.retrieval.reranker      import rerank
+from app.retrieval.vector_search    import search_collections
+from app.retrieval.search_pipeline  import parallel_search
+from app.retrieval.reranker         import rerank
+from app.retrieval.sibling_expansion import expand_with_siblings
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ def route_and_retrieve(
     query:             str,
     classifier_result: dict[str, Any],
     top_k:             int | None = None,
+    mode:              str = "prelims",
 ) -> dict[str, Any]:
     """
     Route the query to the correct retrieval strategy and return reranked chunks.
@@ -65,15 +68,53 @@ def route_and_retrieve(
         query:             The user's original query text.
         classifier_result: Output of query_classifier.classify_query().
         top_k:             Final number of chunks to return (default: RETRIEVAL_FINAL_TOP_K).
+        mode:              Prompt mode passed through to the generator
+                           ("prelims" | "mains" | "current_affairs").
 
     Returns:
         dict with:
             routing    (str)       — "high_confidence" / "medium_confidence" / "low_confidence"
             candidates (list[dict])— raw candidates before reranking
             chunks     (list[dict])— top-K reranked chunks
+            mode       (str)       — prompt mode forwarded from caller
     """
+    # ── Dynamic mode-specific top_k ──────────────────────────────────────────
+    # Prelims  → 5 chunks  (sharp factual precision, fastest)
+    # Current Affairs → 8 chunks  (multi-source web coverage)
+    # Mains    → 10 chunks (broad analytical context for multi-dimensional answers)
     if top_k is None:
-        top_k = RETRIEVAL_FINAL_TOP_K
+        if mode == "mains":
+            top_k = 10
+        elif mode == "current_affairs":
+            top_k = 8
+        else:  # prelims (default)
+            top_k = RETRIEVAL_FINAL_TOP_K
+
+    # ── Current Affairs Mode: Bypass Classifier → Direct Web Search ───────────
+    # Local Qdrant collections only contain static textbook PDFs (History /
+    # Anthropology). They cannot answer questions about recent events.
+    # When mode="current_affairs", skip confidence routing entirely and go
+    # straight to the parallel web search pipeline.
+    if mode == "current_affairs":
+        logger.info(
+            f"Router: mode='current_affairs' → Bypassing classifier. "
+            f"Forcing parallel web search (DuckDuckGo + SearXNG)."
+        )
+        candidates = parallel_search(user_query=query)
+        top_chunks  = rerank(query=query, candidates=candidates, top_k=top_k)
+        # Web search chunks don't have sub_chunk_index so expand_with_siblings is a no-op here.
+        # Included for consistency in case future web-cached chunks adopt the same metadata.
+        top_chunks = expand_with_siblings(top_chunks, PREPROCESSED_DIR)
+        logger.info(
+            f"Router: [current_affairs] candidates={len(candidates)}, "
+            f"top_k={len(top_chunks)}"
+        )
+        return {
+            "routing":    "current_affairs_web",
+            "candidates": candidates,
+            "chunks":     top_chunks,
+            "mode":       mode,
+        }
 
     confidence  = classifier_result["confidence"]
     all_scores  = classifier_result.get("all_scores", {})
@@ -95,6 +136,7 @@ def route_and_retrieve(
             top_k=RETRIEVAL_CANDIDATE_K,
         )
 
+
     # ── Route: Medium Confidence ───────────────────────────────────────────────
     elif confidence >= LOW_CONFIDENCE_THRESHOLD:
         routing     = "medium_confidence"
@@ -111,19 +153,16 @@ def route_and_retrieve(
             top_k=RETRIEVAL_CANDIDATE_K,
         )
 
-    # ── Route: Low Confidence — Global DuckDuckGo Fallback ────────────────────
+    # ── Route: Low Confidence — Parallel Web Search (DDG + SearXNG) ────────────
     else:
         routing = "low_confidence"
 
         logger.info(
             f"Router: LOW confidence ({confidence:.2f}) → "
-            f"Global Retrieval (DuckDuckGo web search)"
+            f"Parallel web search (DuckDuckGo + SearXNG)"
         )
 
-        candidates = web_search(
-            query=query,
-            max_results=RETRIEVAL_CANDIDATE_K,
-        )
+        candidates = parallel_search(user_query=query)
 
     # ── Rerank candidates → Top-K ──────────────────────────────────────────────
     top_chunks = rerank(
@@ -132,13 +171,19 @@ def route_and_retrieve(
         top_k=top_k,
     )
 
+    # ── Sibling Expansion: inject next consecutive sub-chunk if split ───────────
+    # Guarantees complete lists/sections reach the LLM when a dense page was
+    # split across sub-chunks during ingestion. No re-ingestion required.
+    top_chunks = expand_with_siblings(top_chunks, PREPROCESSED_DIR)
+
     logger.info(
         f"Router: Retrieval complete — routing='{routing}', "
-        f"candidates={len(candidates)}, top_k={len(top_chunks)}"
+        f"candidates={len(candidates)}, top_k={len(top_chunks)}, mode='{mode}'"
     )
 
     return {
         "routing":    routing,
         "candidates": candidates,
         "chunks":     top_chunks,
+        "mode":       mode,
     }

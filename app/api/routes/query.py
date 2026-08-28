@@ -8,23 +8,25 @@ Pipeline per request:
   2. Route by confidence:
        High (>0.80)       → Filter 1 Qdrant collection → Vector Search
        Medium (0.50–0.80) → Top-2 Qdrant collections  → Merged Vector Search
-       Low (<0.50)        → DuckDuckGo Global Retrieval
+       Low (<0.50)        → Parallel Web Search (DuckDuckGo + SearXNG)
   3. Rerank candidates   (cross-encoder MiniLM)
   4. Anti-Hallucination  (3 layers):
        Layer 1 — Score Gate: block LLM if best rerank_score < 0.0
-       Layer 2 — Strict context-only prompt: LLM must not use outside knowledge
+       Layer 2 — Mode-specific prompt (prelims/mains/current_affairs)
        Layer 3 — Citation enforcement: every fact tagged with [chunk_id]
   5. Return grounded answer + cited chunks
 
 Request body:
     {
         "query":  "What is cultural ecology?",
-        "top_k":  5   (optional, default 5)
+        "top_k":  5,                    (optional, default 5)
+        "mode":   "prelims"             (optional: prelims | mains | current_affairs)
     }
 
 Response:
     {
         "query":             "What is cultural ecology?",
+        "mode":              "prelims",
         "classification":    "Anthropology",
         "confidence":        0.92,
         "all_scores":        {"Anthropology": 0.92, "History": 0.08},
@@ -35,21 +37,32 @@ Response:
         "citations":         ["chk_0012"],
         "gated":             false,
         "gate_reason":       null,
-        "log_info":          "Query routed strictly to Anthropology Database (92.0% confidence). 20 candidate chunks retrieved and reranked. Answer backed by 1 source(s).",
+        "log_info":          "...",
         "chunks":            [ { ... } ]
     }
 """
 
 import logging
+import asyncio
+import json
 from typing import Optional, Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.retrieval.query_classifier import classify_query
 from app.retrieval.retrieval_router import route_and_retrieve
-from app.retrieval.generator        import generate_grounded_answer
-from app.core.config                import RETRIEVAL_FINAL_TOP_K
+from app.retrieval.generator        import (
+    generate_grounded_answer,
+    get_session_history,
+    save_chat_message,
+    format_history_for_prompt,
+    condense_query,
+)
+from app.retrieval.response_cache   import get_response, set_response, clear_cache, cache_stats
+from app.core.config                import RETRIEVAL_FINAL_TOP_K, TRUSTED_SITES, RESPONSE_CACHE_ENABLED
+from app.database.session           import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +88,20 @@ class QueryRequest(BaseModel):
             f"Default: {RETRIEVAL_FINAL_TOP_K}"
         ),
     )
+    mode: str = Field(
+        default="prelims",
+        description=(
+            "Prompt mode controlling answer style. "
+            "'prelims' — MCQ/fact answer engine. "
+            "'mains' — Structured analytical Mains answer. "
+            "'current_affairs' — Temporally-grounded current events analysis."
+        ),
+        examples=["prelims", "mains", "current_affairs"],
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Optional session ID to enable sliding-window chat conversation memory."
+    )
 
 
 class ChunkResult(BaseModel):
@@ -91,26 +118,30 @@ class CitationResult(BaseModel):
     document:  str
     pages:     Any             # int, list[int], or "?"
     preview:   str
+    url:       Optional[str] = None
 
 
 class QueryResponse(BaseModel):
-    # ── Query metadata ─────────────────────────────────────────────────────────────────────────
+    # ── Query metadata ──────────────────────────────────────────────────────────
     query:            str
+    mode:             str           # Prompt mode used (prelims/mains/current_affairs)
     classification:   str
     confidence:       float
     all_scores:       dict
     routing:          str
     total_candidates: int
-    # ── Anti-hallucination generation output ───────────────────────────────────────────
+    # ── Anti-hallucination generation output ────────────────────────────────────
     answer:           str           # Grounded answer (or "insufficient info")
     answered:         bool          # False = LLM couldn't answer from context
     citations:        list[str]     # Raw chunk_ids cited inline in the answer
     rich_citations:   list[CitationResult]  # Human-readable: doc name + page + preview
     gated:            bool          # True = score gate blocked LLM
     gate_reason:      Optional[str] # Why gate triggered (or None)
-    # ── User-facing transparency log ─────────────────────────────────────────────────────────
+    # ── Cache metadata ──────────────────────────────────────────────────────────
+    cache_hit:        bool          # True = answer served from response cache
+    # ── User-facing transparency log ────────────────────────────────────────────
     log_info:         str           # Human-readable confirmation of which DB was searched
-    # ── Retrieved evidence ───────────────────────────────────────────────────────────────────────
+    # ── Retrieved evidence ──────────────────────────────────────────────────────
     chunks:           list[ChunkResult]
 
 
@@ -130,7 +161,10 @@ class QueryResponse(BaseModel):
         "instead of hallucinating."
     ),
 )
-async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
+async def query_knowledge_base(
+    body: QueryRequest,
+    db: Session = Depends(get_db)
+) -> QueryResponse:
     """
     Full RAG pipeline:
     Query → Classify → Route (High/Medium/Low) → Vector/Web Search
@@ -138,12 +172,36 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
     """
     query = body.query.strip()
     top_k = body.top_k or RETRIEVAL_FINAL_TOP_K
+    mode  = body.mode.strip().lower().replace(" ", "_").replace("-", "_") or "prelims"
+    session_id = body.session_id
 
-    logger.info(f"[QUERY] Incoming: '{query[:80]}' | top_k={top_k}")
+    logger.info(f"[QUERY] Incoming: '{query[:80]}' | top_k={top_k} | mode={mode} | session_id={session_id}")
 
-    # ── Step 1: Classify ───────────────────────────────────────────────────────
+    # ── Response Cache Lookup (skip for current_affairs and active chat sessions) ──
+    # We skip cache when a session has history because the condensed query may differ
+    # from the raw query, and multi-turn context changes the expected answer.
+    use_cache = RESPONSE_CACHE_ENABLED and mode != "current_affairs" and not session_id
+    if use_cache:
+        cached = get_response(query, mode)
+        if cached is not None:
+            cached["cache_hit"] = True
+            logger.info(f"[QUERY] Cache HIT — returning stored answer instantly.")
+            return QueryResponse(**cached)
+
+    # ── Load Conversation History & Condense Query ─────────────────────────────
+    history_str = "No previous conversation history."
+    search_query = query
+
+    if session_id:
+        # Load last 10 messages (5 turns) Chronologically
+        history_msgs = await asyncio.to_thread(get_session_history, db, session_id, limit=10)
+        history_str = format_history_for_prompt(history_msgs)
+        # Rewrite query to be standalone if history exists
+        search_query = await asyncio.to_thread(condense_query, query, history_str)
+
+    # ── Step 1: Classify (using condensed search_query) ────────────────────────
     try:
-        classifier_result = classify_query(query)
+        classifier_result = classify_query(search_query)
     except Exception as exc:
         logger.exception(f"[QUERY] Classification failed: {exc}")
         raise HTTPException(
@@ -151,12 +209,14 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
             detail=f"Query classification failed: {exc}",
         )
 
-    # ── Step 2 + 3: Route → Search → Rerank ───────────────────────────────────
+    # ── Step 2 + 3: Route → Search → Rerank ────────────────────────────────────
     try:
-        retrieval_result = route_and_retrieve(
-            query=query,
-            classifier_result=classifier_result,
-            top_k=top_k,
+        retrieval_result = await asyncio.to_thread(
+            route_and_retrieve,
+            search_query,
+            classifier_result,
+            top_k,
+            mode,
         )
     except Exception as exc:
         logger.exception(f"[QUERY] Retrieval/reranking failed: {exc}")
@@ -169,15 +229,15 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
     candidates = retrieval_result["candidates"]
     routing    = retrieval_result["routing"]
 
-    # ── Step 4: Anti-Hallucination Generation ─────────────────────────────────
-    # Layer 1: Score gate (inside generator)
-    # Layer 2: Strict context-only prompt
-    # Layer 3: Citation enforcement
+    # ── Step 4: Anti-Hallucination Generation ──────────────────────────────────
     try:
-        generation = generate_grounded_answer(
-            query=query,
-            chunks=chunks,
-            source=routing,
+        generation = await asyncio.to_thread(
+            generate_grounded_answer,
+            query,
+            chunks,
+            routing,
+            mode,
+            history_str,
         )
     except Exception as exc:
         logger.exception(f"[QUERY] Generation failed: {exc}")
@@ -186,8 +246,10 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
             "answer":      "Answer generation temporarily unavailable.",
             "answered":    False,
             "citations":   [],
+            "rich_citations": [],
             "gated":       True,
             "gate_reason": f"Generation error: {exc}",
+            "mode":        mode,
         }
 
     # ── Build response ─────────────────────────────────────────────────────────
@@ -227,9 +289,19 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
     elif routing == "low_confidence":
         log_info = (
             f"Low confidence ({confidence_pct:.1f}%) — Query did not match local databases. "
-            f"Routed to global web search (DuckDuckGo). "
-            f"{candidate_count} web results retrieved."
+            f"Routed to parallel web search (DuckDuckGo + SearXNG + Bing). "
+            f"{candidate_count} web results retrieved and reranked."
         )
+    elif routing == "current_affairs_web":
+        trusted_sources_str = ", ".join(TRUSTED_SITES)
+        log_info = (
+            f"Current Affairs mode — Local databases bypassed entirely. "
+            f"Live web search performed via DuckDuckGo + SearXNG + Bing "
+            f"(trusted sources: {trusted_sources_str}). "
+            f"{candidate_count} web articles scraped and reranked. "
+            f"Answer backed by {citation_count} source(s)."
+        )
+
     else:
         log_info = (
             f"Routing: {routing} | Confidence: {confidence_pct:.1f}% | "
@@ -245,28 +317,77 @@ async def query_knowledge_base(body: QueryRequest) -> QueryResponse:
         log_info += " [Result: Answer successfully generated.]"
 
     logger.info(
-        f"[QUERY] Complete — class='{classification}', "
+        f"[QUERY] Complete — class='{classification}', mode='{mode}', "
         f"conf={classifier_result['confidence']:.2f}, routing='{routing}', "
         f"answered={generation['answered']}, gated={generation['gated']}, "
         f"candidates={len(candidates)}, chunks={len(chunk_results)}"
     )
     logger.info(f"[LOG_INFO] {log_info}")
 
-    return QueryResponse(
+    result_payload = QueryResponse(
         query=            query,
+        mode=             generation.get("mode", mode),
         classification=   classification,
         confidence=       classifier_result["confidence"],
         all_scores=       classifier_result.get("all_scores", {}),
         routing=          routing,
-        total_candidates= len(candidates),
-        answer=           generation["answer"],
-        answered=         generation["answered"],
-        citations=        generation["citations"],
-        rich_citations=   [
-            CitationResult(**c) for c in generation.get("rich_citations", [])
-        ],
-        gated=            generation["gated"],
+        total_candidates= candidate_count,
+        answer=           generation.get("answer", ""),
+        answered=         generation.get("answered", False),
+        citations=        generation.get("citations", []),
+        rich_citations=   generation.get("rich_citations", []),
+        gated=            generation.get("gated", False),
         gate_reason=      generation.get("gate_reason"),
+        cache_hit=        False,
         log_info=         log_info,
         chunks=           chunk_results,
     )
+
+    # ── Save Conversation Turns to Database ────────────────────────────────────
+    if session_id:
+        # Save user query
+        await asyncio.to_thread(save_chat_message, db, session_id, "user", query)
+        # Save assistant answer (serialize response payload)
+        response_json = json.dumps({
+            "answer": result_payload.answer,
+            "answered": result_payload.answered,
+            "citations": result_payload.citations
+        })
+        await asyncio.to_thread(save_chat_message, db, session_id, "assistant", response_json)
+
+    # ── Store in response cache (only when answered=True and no active session) ──
+    if use_cache:
+        set_response(query, mode, result_payload.model_dump())
+
+    return result_payload
+
+
+# ── Admin endpoints ────────────────────────────────────────────────────────────
+
+@router.delete(
+    "/cache",
+    status_code=200,
+    summary="Clear the response cache (admin)",
+    description="Deletes all cached RAG responses. Subsequent requests will re-run the full pipeline.",
+    tags=["admin"],
+)
+async def clear_response_cache():
+    """
+    Wipe all entries from the response cache.
+    The next identical query will re-run classify → search → rerank → LLM.
+    """
+    deleted = await asyncio.to_thread(clear_cache)
+    logger.info(f"[ADMIN] Response cache cleared — {deleted} entries removed.")
+    return {"message": f"Response cache cleared. {deleted} entries removed."}
+
+
+@router.get(
+    "/cache/stats",
+    status_code=200,
+    summary="Response cache statistics (admin)",
+    tags=["admin"],
+)
+async def response_cache_stats():
+    """Return current response cache statistics (live entries, expired, config)."""
+    stats = await asyncio.to_thread(cache_stats)
+    return stats

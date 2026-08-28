@@ -35,3 +35,6 @@ qdrant-client>=1.9.0
 # Retrieval Layer
 duckduckgo-search>=6.0.0       # DuckDuckGo web search fallback (low-confidence queries)
 google-generativeai>=0.8.0     # Gemini Flash query classifier
+requests>=2.31.0               # HTTP client for web scraping + Groq API calls
+beautifulsoup4>=4.12.0         # HTML parsing for article scraping
+lxml>=5.0.0                    # Fast HTML/XML parser (bs4 backend)

@@ -34,6 +34,17 @@ def _get_reranker():
     return _reranker_model
 
 
+def preload_reranker() -> None:
+    """
+    Eagerly initialise the cross-encoder model at server startup.
+
+    Call this inside the FastAPI lifespan handler so the model is warm and
+    ready before the first user request arrives, eliminating cold-start delay.
+    """
+    _get_reranker()
+    logger.info("Reranker pre-loaded and ready ✓")
+
+
 def rerank(
     query: str,
     candidates: list[dict[str, Any]],
