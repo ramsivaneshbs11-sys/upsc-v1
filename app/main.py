@@ -22,8 +22,10 @@ if str(_WORKSPACE_ROOT) not in sys.path:
 import os
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.database.session import engine, Base
@@ -32,7 +34,14 @@ from app.api.routes import documents
 from app.api.routes import extract_page as extract_page_v2
 from app.api.routes import query as query_route
 from app.api.routes import classifications as classification_route  # NEW — dynamic classification management
+from app.api.routes import query_stream as query_stream_route       # SSE streaming endpoint
 from app.services.qdrant_service import ensure_collections
+from app.core.config import (
+    RESPONSE_CACHE_ENABLED,
+    RESPONSE_CACHE_TTL_SECONDS,
+    RESPONSE_CACHE_MAXSIZE,
+    RESPONSE_CACHE_SQLITE_PATH,
+)
 
 
 # ── Logging ───────────────────────────────────────────────────────────────
@@ -52,6 +61,29 @@ async def lifespan(app: FastAPI):
 
     logger.info("Verifying Qdrant collections …")
     ensure_collections()
+
+    # ── Pre-load the reranker model so first user request has no cold-start ──
+    logger.info("Pre-loading cross-encoder reranker model …")
+    from app.retrieval.reranker import preload_reranker
+    preload_reranker()
+
+    # ── Pre-load the BGE embedding model so first search request has no cold-start ──
+    logger.info("Pre-loading BGE embedding model …")
+    from app.services.embedding_service import _get_model as preload_embedding
+    preload_embedding()
+
+    # ── Initialise response cache ─────────────────────────────────────────
+    from app.retrieval.response_cache import init_cache as init_response_cache
+    init_response_cache(
+        db_path     = RESPONSE_CACHE_SQLITE_PATH,
+        ttl_seconds = RESPONSE_CACHE_TTL_SECONDS,
+        max_entries = RESPONSE_CACHE_MAXSIZE,
+        enabled     = RESPONSE_CACHE_ENABLED,
+    )
+    logger.info(
+        f"Response cache ready ✔ "
+        f"(enabled={RESPONSE_CACHE_ENABLED}, ttl={RESPONSE_CACHE_TTL_SECONDS}s)"
+    )
 
     yield
     logger.info("Shutting down …")
@@ -80,6 +112,26 @@ app = FastAPI(
     version="3.0.0",
     lifespan=lifespan,
 )
+
+# ── CORS Middleware ──────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Serve UI & Favicon ───────────────────────────────────────────────────────
+@app.get("/", response_class=FileResponse, tags=["UI"])
+def read_root():
+    """Serves the upsc_ui.html frontend interface."""
+    return FileResponse(_WORKSPACE_ROOT / "upsc_ui.html")
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Handles browser favicon requests with 204 No Content to prevent 404 logs."""
+    return Response(status_code=204)
 
 # ── Dynamic OpenAPI Fix for Swagger UI File Uploads ──────────────────────────
 def custom_openapi():
@@ -117,6 +169,7 @@ app.include_router(documents.router)
 app.include_router(extract_page_v2.router)
 # Retrieval
 app.include_router(query_route.router)
+app.include_router(query_stream_route.router)   # SSE streaming variant
 # Classification Management (NEW — dynamic classification registration)
 app.include_router(classification_route.router)
 

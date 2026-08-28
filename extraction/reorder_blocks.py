@@ -17,8 +17,8 @@ Post-process ``text_blocks`` per page, before saving JSON:
 2. Split non-full-width blocks into left (``bbox[0] < mid_x - margin``) and
    right (``bbox[0] >= mid_x - margin``) columns.
 3. Sort each column top→bottom.
-   In Docling's coordinate system HIGH y = top-of-page, so top→bottom order
-   corresponds to *descending* ``bbox[1]``.
+   In Docling's coordinate system (0,0) is TOP-LEFT and y INCREASES downward,
+   so top→bottom order corresponds to *ascending* ``bbox[1]``.
 4. Concatenate: all of left column then all of right column.
 5. Full-width blocks (bbox width > 70 % of page width) act as **section-break
    anchors** — they stay in their natural vertical position and the column sort
@@ -147,9 +147,11 @@ def reorder_page_blocks(
         return b["bbox"][1] if _has_bbox(b) else 0.0
 
     # ------------------------------------------------------------------
-    # Pre-sort by descending top-y so anchor block positions are stable.
+    # Pre-sort by ascending top-y (Docling: y=0 is top-of-page, y increases
+    # downward) so anchor block positions are stable and reading order is
+    # top-to-bottom.
     # ------------------------------------------------------------------
-    sorted_blocks = sorted(blocks, key=lambda b: -top_y(b))
+    sorted_blocks = sorted(blocks, key=lambda b: top_y(b), reverse=False)
 
     # ------------------------------------------------------------------
     # Split into segments at each full-width block (section-break anchors).
@@ -189,8 +191,9 @@ def reorder_page_blocks(
             if _has_bbox(b) and b["bbox"][0] >= mid_x - margin
         ]
 
-        left_col.sort(key=lambda b: -top_y(b))
-        right_col.sort(key=lambda b: -top_y(b))
+        # Sort ascending top-y = top-to-bottom reading order
+        left_col.sort(key=lambda b: top_y(b), reverse=False)
+        right_col.sort(key=lambda b: top_y(b), reverse=False)
 
         ordered.extend(left_col)
         ordered.extend(right_col)
