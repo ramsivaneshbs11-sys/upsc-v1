@@ -15,7 +15,7 @@ from pathlib import Path
 import logging
 
 # Set up workspace path
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 logging.basicConfig(

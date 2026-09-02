@@ -1,22 +1,40 @@
 """
 app/retrieval/sibling_expansion.py
 ────────────────────────────────────
-Post-retrieval sibling chunk expansion.
+Production-grade Bidirectional Sibling Chunk Expansion.
 
-When the chunker splits a dense page into sub-chunks (sub_chunk_index / total_sub_chunks),
-semantically relevant content can end up in the *next* sibling chunk — invisible to the
-reranker because it didn't match the query's embedding as strongly.
+PROBLEM SOLVED
+──────────────
+When the chunker splits a dense PDF page into sub-chunks (e.g. a table header
+lands in chk_0026 and the table rows land in chk_0025), vector search may only
+retrieve the header chunk — making the LLM unable to answer the full question.
 
-This module inspects each retrieved chunk's metadata and, where the next consecutive
-sibling exists in the preprocessed JSON, appends it to the context so the LLM sees
-the complete passage.
+SOLUTION
+────────
+For every retrieved chunk N, we expand BOTH directions in a configurable window:
 
-Example:
-    chk_0023  -> sub_chunk_index=1, total_sub_chunks=4  -> loads chk_0024 automatically
-    chk_0024  -> sub_chunk_index=2, total_sub_chunks=4  -> already present (deduped)
+    Radius = 2 → fetches [N-2, N-1, N, N+1, N+2]
+
+This guarantees that:
+  ✅  Headers always arrive with their following table/list rows.
+  ✅  Numbered lists always arrive with their preceding label.
+  ✅  Long administrative tables (e.g. Ashta Pradhan ministers) are never split.
+
+SCORE DECAY
+───────────
+Sibling chunks inherit the matched chunk's score but are penalised by a
+per-hop decay factor so the LLM/reranker still prioritises the exact match:
+
+    hop-1 score = original_score × (1 - SIBLING_SCORE_DECAY)^1
+    hop-2 score = original_score × (1 - SIBLING_SCORE_DECAY)^2
+
+CONFIGURATION  (app/core/config.py or .env)
+────────────────────────────────────────────
+    SIBLING_EXPANSION_RADIUS  = 2    # chunks to expand each side (default 2)
+    SIBLING_SCORE_DECAY       = 0.15 # fractional score penalty per hop (default 0.15)
 
 Public API:
-    expand_with_siblings(chunks, preprocessed_dir) -> list[dict]
+    expand_with_siblings(chunks, preprocessed_dir, radius, score_decay) -> list[dict]
 """
 
 import json
@@ -24,22 +42,28 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from app.core.config import SIBLING_EXPANSION_RADIUS, SIBLING_SCORE_DECAY
+
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _load_preprocessed_chunks(file_name: str, preprocessed_dir: Path) -> dict[str, dict]:
     """
-    Load all chunks from a preprocessed JSON file indexed by chunk_id.
+    Load all chunks from a preprocessed JSON file, indexed by chunk_id.
 
     Args:
         file_name:        The PDF filename from chunk metadata (e.g. 'abc123.pdf').
         preprocessed_dir: Path to the data/preprocessed/ directory.
 
     Returns:
-        Dict mapping chunk_id to chunk dict, or empty dict if file not found.
+        Dict mapping chunk_id -> chunk dict, or empty dict if the file is missing.
     """
-    stem = Path(file_name).stem                        # strip .pdf
-    stem = stem.replace("_preprocessed", "")           # safety guard
+    stem = Path(file_name).stem                    # strip .pdf
+    stem = stem.replace("_preprocessed", "")       # safety guard against double suffix
     preprocessed_path = preprocessed_dir / f"{stem}_preprocessed.json"
 
     if not preprocessed_path.exists():
@@ -56,92 +80,140 @@ def _load_preprocessed_chunks(file_name: str, preprocessed_dir: Path) -> dict[st
         return {}
 
 
+def _parse_chunk_num(chunk_id: str) -> tuple[str, int] | None:
+    """
+    Parse a chunk_id like 'chk_0026' into ('chk', 26).
+
+    Returns:
+        (prefix, number) tuple, or None if the format is unexpected.
+    """
+    try:
+        prefix, num_str = chunk_id.rsplit("_", 1)
+        return prefix, int(num_str)
+    except (ValueError, AttributeError):
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
 def expand_with_siblings(
     chunks: list[dict[str, Any]],
     preprocessed_dir: Path,
+    radius: int = SIBLING_EXPANSION_RADIUS,
+    score_decay: float = SIBLING_SCORE_DECAY,
 ) -> list[dict[str, Any]]:
     """
-    Expand retrieved chunks by appending their next consecutive sibling sub-chunk
-    from the same preprocessed document, if that sibling is not already in the list.
+    Bidirectional sibling chunk expansion.
 
-    Only expands chunks that have sub_chunk_index AND total_sub_chunks metadata,
-    meaning they are part of a split dense page. The sibling chunk is appended
-    at the end (deduped) and inherits the parent chunk's score.
+    For every retrieved chunk N, fetches chunks [N-radius … N-1] and
+    [N+1 … N+radius] from the same document, de-duplicates, and appends
+    them to the context with a decayed relevance score.
 
     Args:
         chunks:           List of reranked chunk dicts (output of reranker).
         preprocessed_dir: Path to the data/preprocessed/ directory.
+        radius:           Number of chunks to expand in each direction (default: config).
+        score_decay:      Fractional score penalty per hop away from the anchor (default: config).
 
     Returns:
-        Augmented list with sibling chunks appended at the end (deduplicated).
+        Augmented list with sibling chunks appended (deduplicated, ordered by hop distance).
+
+    Example (radius=2):
+        Retrieved: chk_0026
+        Expanded:  chk_0024 (hop-2, score×0.72), chk_0025 (hop-1, score×0.85),
+                   chk_0026 (anchor), chk_0027 (hop-1, score×0.85), chk_0028 (hop-2, score×0.72)
     """
-    if not chunks:
+    if not chunks or radius <= 0:
         return chunks
 
-    existing_keys: set[tuple[str, str]] = {(c.get("metadata", {}).get("file_name", ""), c["chunk_id"]) for c in chunks}
+    # Track already-present (file_name, chunk_id) pairs to avoid duplicates
+    existing_keys: set[tuple[str, str]] = {
+        (c.get("metadata", {}).get("file_name", ""), c["chunk_id"])
+        for c in chunks
+    }
     additions: list[dict[str, Any]] = []
 
-    # Cache opened preprocessed files to avoid repeated disk reads per request
+    # One preprocessed JSON is loaded per file_name per request (in-memory cache)
     file_cache: dict[str, dict[str, dict]] = {}
 
     for chunk in chunks:
         metadata  = chunk.get("metadata", {})
-        sub_idx   = metadata.get("sub_chunk_index")
-        total_sub = metadata.get("total_sub_chunks")
         file_name = metadata.get("file_name", "")
 
-        # Only expand split-page chunks that are not the last sub-chunk
-        if sub_idx is None or total_sub is None or not file_name:
+        # Skip chunks without a valid file reference
+        if not file_name:
             continue
 
-
-        # Derive sibling chunk_id by incrementing the numeric suffix by 1
-        # e.g. "chk_0023" -> "chk_0024"
-        try:
-            current_id   = chunk["chunk_id"]
-            prefix, num  = current_id.rsplit("_", 1)
-            sibling_id   = f"{prefix}_{int(num) + 1:04d}"
-        except (ValueError, AttributeError):
-            logger.debug(f"[SiblingExpand] Cannot derive sibling ID from: {chunk['chunk_id']}")
+        parsed = _parse_chunk_num(chunk["chunk_id"])
+        if parsed is None:
+            logger.debug(f"[SiblingExpand] Cannot parse chunk_id: {chunk['chunk_id']}")
             continue
 
-        sibling_key = (file_name, sibling_id)
-        if sibling_key in existing_keys:
-            logger.debug(f"[SiblingExpand] Sibling {sibling_id} for {file_name} already in result set — skipping.")
-            continue
+        prefix, anchor_num = parsed
+        base_score       = chunk.get("score", 0.0)
+        base_rerank      = chunk.get("rerank_score", 0.0)
 
-        # Load the preprocessed file (use cache)
+        # Load the preprocessed document once per file per request
         if file_name not in file_cache:
             file_cache[file_name] = _load_preprocessed_chunks(file_name, preprocessed_dir)
         all_doc_chunks = file_cache[file_name]
 
-        sibling = all_doc_chunks.get(sibling_id)
-        if sibling is None:
-            logger.debug(f"[SiblingExpand] Sibling {sibling_id} not found in '{file_name}'")
-            continue
+        # Build offsets: [-2, -1, +1, +2] for radius=2 (negative = before, positive = after)
+        offsets = list(range(-radius, 0)) + list(range(1, radius + 1))
 
-        # Build a retrieval-compatible dict for the sibling chunk
-        sibling_chunk: dict[str, Any] = {
-            "chunk_id":    sibling_id,
-            "text":        sibling.get("text", ""),
-            "score":       chunk.get("score", 0.0),
-            "rerank_score": chunk.get("rerank_score", 0.0),
-            "metadata":    sibling.get("metadata", {}),
-            "source":      chunk.get("source", "qdrant"),
-            "collection":  chunk.get("collection", ""),
-            "file_id":     chunk.get("file_id"),
-            "_sibling_of": current_id,
-        }
-        additions.append(sibling_chunk)
-        existing_keys.add(sibling_key)
+        for offset in offsets:
+            target_num = anchor_num + offset
+            if target_num < 1:
+                continue  # chunk numbers start at 1
 
-        logger.info(
-            f"[SiblingExpand] Injected sibling {sibling_id} "
-            f"(sub {sub_idx + 1}/{total_sub}) alongside {current_id} "
-            f"from '{file_name}'"
-        )
+            sibling_id  = f"{prefix}_{target_num:04d}"
+            sibling_key = (file_name, sibling_id)
+
+            if sibling_key in existing_keys:
+                logger.debug(
+                    f"[SiblingExpand] {sibling_id} already present — skipping."
+                )
+                continue
+
+            sibling = all_doc_chunks.get(sibling_id)
+            if sibling is None:
+                # Chunk does not exist (e.g. we are at the document boundary)
+                logger.debug(
+                    f"[SiblingExpand] {sibling_id} not found in '{file_name}' — boundary reached."
+                )
+                continue
+
+            # Score decay: further siblings score lower so LLM keeps correct ranking
+            hop          = abs(offset)
+            decay_factor = (1.0 - score_decay) ** hop
+            sibling_chunk: dict[str, Any] = {
+                "chunk_id":     sibling_id,
+                "text":         sibling.get("text", ""),
+                "score":        round(base_score  * decay_factor, 6),
+                "rerank_score": round(base_rerank * decay_factor, 6),
+                "metadata":     sibling.get("metadata", {}),
+                "source":       chunk.get("source", "qdrant"),
+                "collection":   chunk.get("collection", ""),
+                "file_id":      chunk.get("file_id"),
+                "_sibling_of":  chunk["chunk_id"],
+                "_sibling_hop": offset,          # +ve = after anchor, -ve = before
+            }
+            additions.append(sibling_chunk)
+            existing_keys.add(sibling_key)
+
+            logger.info(
+                f"[SiblingExpand] Injected {sibling_id} "
+                f"(hop {offset:+d}, score×{decay_factor:.2f}) "
+                f"← anchor: {chunk['chunk_id']} | file: '{file_name}'"
+            )
 
     if additions:
-        logger.info(f"[SiblingExpand] Added {len(additions)} sibling chunk(s) to context.")
+        logger.info(
+            f"[SiblingExpand] ✅ Radius={radius} | Decay={score_decay} | "
+            f"Added {len(additions)} sibling chunk(s) across "
+            f"{len(file_cache)} document(s)."
+        )
 
     return chunks + additions

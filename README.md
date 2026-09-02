@@ -1,96 +1,77 @@
-# 📚 UPSC RAG Chatbot
+# 📚 UPSC RAG & Current Affairs AI Platform
 
-A **production-grade Retrieval-Augmented Generation (RAG)** system built specifically for **UPSC exam preparation**. It ingests UPSC study material PDFs, embeds them into a vector database, and lets you ask questions in natural language — with conversation memory, anti-hallucination safeguards, and live web search fallback.
-
----
-
-## 🧠 What Does This Chatbot Do?
-
-When you ask a UPSC question, the system:
-
-1. **Understands your intent** — classifies whether the question is from the ingested study corpus or needs a live web search.
-2. **Condenses follow-up queries** — if you ask *"What is its current status?"*, it rewrites it into a standalone query like *"Status of ISRO's Gaganyaan mission"* using conversational context.
-3. **Retrieves the best context** — either from the Qdrant vector database (ingested UPSC PDFs) or from live web scraping (DuckDuckGo + SearXNG).
-4. **Generates a grounded answer** — using a Gemini or Groq LLM, strictly based on the retrieved context (no hallucination).
-5. **Remembers your conversation** — stores the last 5 turns of chat history per session and injects it into the prompt for multi-turn dialogue.
-6. **Cites its sources** — every answer includes clickable citations so you can verify the information.
+A **production-grade Retrieval-Augmented Generation (RAG)** system built specifically for **UPSC Civil Services Examination preparation**. It combines deep syllabus-grounded PDF textbook retrieval with an automated **Daily News & Current Affairs Engine** (MCQ practice, Mains answer generation, executive summaries, and live source verification).
 
 ---
 
-## 🏗️ System Architecture
+## 🧠 System Overview & Capabilities
 
 ```
-                        ┌─────────────────────────────┐
-                        │       upsc_ui.html           │
-                        │   (Browser Chat Interface)   │
-                        └──────────────┬──────────────┘
-                                       │  POST /api/v1/query
-                                       ▼
-                        ┌─────────────────────────────┐
-                        │     FastAPI Application      │
-                        │      (app/main.py)            │
-                        └──────────────┬──────────────┘
-                                       │
-                    ┌──────────────────▼───────────────────┐
-                    │          Query Processing             │
-                    │                                       │
-                    │  1. Load Conversation History (DB)    │
-                    │  2. Condense Follow-up Queries (LLM)  │
-                    │  3. Classify Query Intent (LLM)       │
-                    └──────────┬──────────────────┬────────┘
-                               │                  │
-               ┌───────────────▼──┐          ┌────▼───────────────┐
-               │  HIGH CONFIDENCE  │          │  LOW CONFIDENCE    │
-               │  (UPSC Corpus)    │          │  (General / Live)  │
-               │                  │          │                    │
-               │  Qdrant Search   │          │  Web Search        │
-               │  + Cross-Encoder │          │  (DuckDuckGo +     │
-               │    Reranking     │          │   SearXNG)         │
-               └───────────┬──────┘          └──────┬─────────────┘
-                           │                         │
-                           └────────────┬────────────┘
-                                        ▼
-                            ┌───────────────────────┐
-                            │   LLM Response Gen    │
-                            │  (Gemini / Groq LLM)  │
-                            │  with History + Ctx   │
-                            └───────────┬───────────┘
-                                        │
-                            ┌───────────▼───────────┐
-                            │  Save to Chat History  │
-                            │  (PostgreSQL DB)        │
-                            └───────────────────────┘
+                                    ┌─────────────────────────────┐
+                                    │       upsc_ui.html          │
+                                    │   (Browser Chat Interface)  │
+                                    └──────────────┬──────────────┘
+                                                   │ POST /api/v1/query
+                                                   ▼
+                                    ┌─────────────────────────────┐
+                                    │     FastAPI Application     │
+                                    │       (app/main.py)         │
+                                    └──────────────┬──────────────┘
+                                                   │
+                                ┌──────────────────▼───────────────────┐
+                                │          Query Processing            │
+                                │  1. Load Conversation History (DB)   │
+                                │  2. Condense Follow-up Queries (LLM) │
+                                │  3. Classify Mode / Syllabus Paper   │
+                                └──────────────────┬───────────────────┘
+                                                   │
+                  ┌────────────────────────────────┼────────────────────────────────┐
+                  ▼                                ▼                                ▼
+       ┌─────────────────────┐          ┌─────────────────────┐          ┌─────────────────────┐
+       │   📝 PRELIMS MODE   │          │    📄 MAINS MODE    │          │ 🌐 CURRENT AFFAIRS  │
+       │ (Textbooks & PDFs)  │          │ (Analytical Papers) │          │  (Daily News & Web) │
+       └──────────┬──────────┘          └──────────┬──────────┘          └──────────┬──────────┘
+                  │                                │                                │
+                  └────────────────┬───────────────┘                                │
+                                   │                                                │
+                     ┌─────────────▼─────────────┐                    ┌─────────────▼─────────────┐
+                     │ Qdrant Vector Search      │                    │ 1. Qdrant Daily News Store│
+                     │ (History / Anthropology)  │                    │ 2. DuckDuckGo / SearXNG   │
+                     └─────────────┬─────────────┘                    └─────────────┬─────────────┘
+                                   │                                                │
+                                   └───────────────────────┬────────────────────────┘
+                                                           ▼
+                                            ┌─────────────────────────────┐
+                                            │ MS-MARCO MiniLM Reranker    │
+                                            │ (Top-5 High Scoring Chunks) │
+                                            └──────────────┬──────────────┘
+                                                           ▼
+                                            ┌─────────────────────────────┐
+                                            │ LLM Response Generation     │
+                                            │ (Gemini 2.5 / Groq LLMs)    │
+                                            └──────────────┬──────────────┘
+                                                           ▼
+                                            ┌─────────────────────────────┐
+                                            │ Answer + Clickable Citations│
+                                            │ (Persisted to PostgreSQL)   │
+                                            └─────────────────────────────┘
 ```
 
 ---
 
-## ✨ Key Features
+## ✨ Core Features
 
 | Feature | Description |
 |---|---|
-| 🔍 **Hybrid Retrieval** | Vector DB search (Qdrant) + Live web fallback (DuckDuckGo) |
-| 🧩 **Query Classification** | LLM classifies queries as Corpus-bound or Web-search |
-| 📊 **Cross-Encoder Reranking** | MS-MARCO MiniLM reranker for precise top-K chunk selection |
-| 💬 **Conversation Memory** | Sliding window of last 5 turns persisted in PostgreSQL |
-| 🔄 **Query Condensation** | Rewrites pronouns in follow-ups into standalone queries |
-| 📰 **Current Affairs Mode** | Scrapes live news articles for recent events |
-| 🛡️ **Anti-Hallucination Layer** | LLM is instructed to answer only from retrieved context |
-| 📌 **Source Citations** | Every answer includes a clickable list of sources |
-| 🌊 **Streaming Responses** | Server-Sent Events (SSE) endpoint for token-level streaming |
-| 📄 **PDF Ingestion Pipelines** | Two ingestion engines for digital and scanned PDFs |
-
----
-
-## 🚀 API Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v1/documents` | Ingest digital PDFs via local Docling engine |
-| `POST` | `/api/v2/documents` | Ingest scanned PDFs via Gemini Flash VLM |
-| `POST` | `/api/v1/query` | Query the RAG system (standard JSON response) |
-| `POST` | `/api/v1/query/stream` | Query the RAG system (SSE streaming response) |
-| `GET` | `/health` | Service health check |
-| `GET` | `/docs` | Interactive Swagger UI |
+| 🔍 **Multi-Mode RAG Retrieval** | Dedicated routing for **Prelims (Static)**, **Mains (Analytical)**, and **Current Affairs**. |
+| 📰 **Unified Current Affairs Hub** | Background scraper (06:00 AM) auto-indexes *The Hindu* and *PIB* directly into Qdrant for **<1s latency**. |
+| 🎯 **Dynamic Sub-Modes** | Current Affairs supports **MCQs Practice**, **News Summary (3-points)**, and **Detailed Explanation**. |
+| 🔗 **Source Verification** | Every response includes clickable **"Read More"** links pointing to official government gazettes & editorial pages. |
+| ⚡ **Cross-Encoder Reranking** | Uses `cross-encoder/ms-marco-MiniLM-L-6-v2` for precise semantic scoring of retrieved passages. |
+| 💬 **Conversational Memory** | Sliding window of recent turns stored in PostgreSQL with intelligent pronoun condensation. |
+| 🛡️ **Anti-Hallucination Guardrails** | Strict citation grounding enforcing that answers are synthesized exclusively from verified context. |
+| 🌊 **Server-Sent Events (SSE)** | Live token-level streaming endpoint (`/api/v1/query/stream`) with real-time pipeline status indicators. |
+| 📄 **Dual PDF Ingestion Engines** | Specialized parsing for digital PDFs (Docling) and scanned handwritten notes (Gemini VLM). |
 
 ---
 
@@ -100,197 +81,185 @@ When you ask a UPSC question, the system:
 RAG-main/
 ├── app/
 │   ├── api/routes/
-│   │   ├── documents.py         # POST /api/v1/documents — Docling ingestion
-│   │   ├── extract_page.py      # POST /api/v2/documents — Gemini VLM ingestion
-│   │   ├── query.py             # POST /api/v1/query — RAG query with memory
-│   │   └── query_stream.py      # POST /api/v1/query/stream — SSE streaming
-│   ├── core/config.py           # Environment configuration loader
+│   │   ├── documents.py            # POST /api/v1/documents — Docling digital PDF ingestion
+│   │   ├── extract_page.py         # POST /api/v2/documents — Gemini VLM scanned PDF ingestion
+│   │   ├── query.py                # POST /api/v1/query — Standard RAG query endpoint
+│   │   └── query_stream.py         # POST /api/v1/query/stream — SSE real-time streaming endpoint
+│   ├── core/
+│   │   ├── config.py               # Environment variables, Qdrant collections & model configs
+│   │   └── response_cache.py       # SQLite response caching engine (24h TTL)
 │   ├── database/
-│   │   ├── session.py           # SQLAlchemy connection setup
-│   │   ├── models.py            # PostgreSQL models (Documents + ChatMessages)
-│   │   └── repository.py        # Database CRUD helpers
+│   │   ├── session.py              # SQLAlchemy engine & session factory
+│   │   ├── models.py               # PostgreSQL schema (Document & ChatMessage tables)
+│   │   └── repository.py           # Database CRUD helpers
 │   ├── retrieval/
-│   │   ├── query_classifier.py  # LLM query intent classifier
-│   │   ├── retrieval_router.py  # Routes to vector search or web search
-│   │   ├── vector_search.py     # Qdrant hybrid vector lookup
-│   │   ├── reranker.py          # MS-MARCO cross-encoder reranker
-│   │   ├── web_search.py        # DuckDuckGo + SearXNG web scraper
-│   │   ├── search_pipeline.py   # Current affairs live article pipeline
-│   │   ├── prompts.py           # System prompt templates (Prelims/Mains/CA)
-│   │   └── generator.py         # LLM response gen + conversation memory
+│   │   ├── query_classifier.py     # Intent classification & routing engine
+│   │   ├── vector_search.py        # Qdrant hybrid similarity search
+│   │   ├── reranker.py             # Cross-encoder semantic reranking
+│   │   ├── search_pipeline.py      # DuckDuckGo + SearXNG live web search pipeline
+│   │   ├── article_cache.py        # SQLite cache for scraped web articles (6h TTL)
+│   │   ├── prompts.py              # Exam-specific system prompt templates
+│   │   └── generator.py            # Multi-LLM synthesis (Gemini 2.5 / Groq)
 │   ├── services/
-│   │   ├── storage_service.py      # PDF storage handler
-│   │   ├── extraction_service.py   # Docling bridge + QA audit
-│   │   ├── page_extraction_service.py # Gemini page-by-page extractor
-│   │   ├── preprocessing_service.py   # Layout-aware chunking
-│   │   ├── embedding_service.py       # BGE SentenceTransformer embeddings
-│   │   ├── qdrant_service.py          # Qdrant upsert + collection manager
-│   │   └── ingest_pipeline.py         # Core ingestion orchestrator
-│   └── main.py                  # FastAPI entry point + DB lifespan
-├── extraction/                  # Docling + Gemini VLM parsing modules
-├── preprocessing/               # Layout-aware cleaning + chunking engine
-├── tests/                       # Test suite (52 tests)
-│   ├── test_conversation_memory.py  # Chat/memory persistence tests
-│   ├── test_prompt_selection.py     # Prompt routing & formatting tests
-│   ├── test_search_pipeline.py      # Web search pipeline tests
-│   ├── test_metrics.py              # Evaluation metric tests
-│   └── test_article_cache.py        # Article caching tests
-├── upsc_ui.html                 # Browser-based chat UI
-├── docker-compose.yml           # PostgreSQL + Qdrant services
-├── .env.example                 # Environment configuration template
-└── requirements_api.txt         # API runtime dependencies
+│   │   ├── embedding_service.py    # BAAI/bge-base-en-v1.5 sentence embeddings
+│   │   ├── qdrant_service.py       # Qdrant collection management & vector upserts
+│   │   └── ingest_pipeline.py      # Core document indexing orchestrator
+│   └── main.py                     # FastAPI application entry point with lifespan lifecycle
+├── extraction/                     # Docling layout parsing & column re-ordering logic
+├── preprocessing/                  # Layout-aware chunking & text cleaning engine
+├── tests/                          # Automated test suite (50+ unit & integration tests)
+├── upsc_ui.html                    # Interactive browser frontend for querying & testing
+├── docker-compose.yml              # PostgreSQL + Qdrant container configurations
+├── requirements_api.txt            # Production Python dependencies
+└── .env.example                    # Environment variables template
 ```
 
 ---
 
-## ⚙️ Quick Start
+## ⚙️ Quick Start Guide
 
-### 1. Start Infrastructure (Docker)
+### 1. Start Database Containers (Docker)
 
-```bash
+Make sure **Docker Desktop** is running, then start **PostgreSQL** and **Qdrant**:
+
+```powershell
 docker-compose up -d
 ```
 
-This starts:
-- **PostgreSQL** at `localhost:5432` — stores document metadata and chat history
-- **Qdrant Vector DB** at `localhost:6333` — stores embedded UPSC PDF chunks
+* **PostgreSQL:** Running on `localhost:5432` (Stores document metadata & chat memory)
+* **Qdrant Vector DB:** Running on `localhost:6333` (Stores embedded PDF chunks & current affairs vectors)
 
-### 2. Configure Environment
+---
 
-```bash
-cp .env.example .env
-```
+### 2. Environment Configuration
 
-Edit `.env` with your keys:
+Create a `.env` file in the root directory (or copy from `.env.example`):
 
 ```env
+# PostgreSQL
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/upsc_rag
+
+# Qdrant
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
+
+# Embedding Model
 EMBEDDING_MODEL_NAME=BAAI/bge-base-en-v1.5
 
-# LLM keys (use at least one)
+# LLM API Keys (At least one required)
 GEMINI_API_KEY=your_gemini_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama-3.3-70b-specdec
+GROQ_MODEL=openai/gpt-oss-120b
+
+# Reranker Model
+RERANKER_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-6-v2
 ```
 
-### 3. Install Dependencies
+---
 
-```bash
+### 3. Install Python Dependencies
+
+```powershell
 pip install -r requirements_api.txt
 ```
 
-### 4. Start the API Server
+---
 
-```bash
-uvicorn app.main:app --reload
+### 4. Start the Application Server
+
+Launch the FastAPI backend with Uvicorn:
+
+```powershell
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-| Service | URL |
+| Service | Access URL |
 |---|---|
-| **Chat UI** | Open `upsc_ui.html` directly in your browser |
-| **Swagger Docs** | http://localhost:8000/docs |
-| **Health Check** | http://localhost:8000/health |
+| **Chat Interface** | Open [`upsc_ui.html`](file:///c:/Users/vishn/Downloads/RAG-main/RAG-main/upsc_ui.html) directly in your browser |
+| **Interactive Swagger Docs** | [http://localhost:8000/docs](http://localhost:8000/docs) |
+| **Health Check Endpoint** | [http://localhost:8000/health](http://localhost:8000/health) |
 
 ---
 
-## 💬 Using the Chat UI
+## 🚀 API Reference
 
-1. Open `upsc_ui.html` in your browser.
-2. Select the **query mode**: Prelims, Mains, or Current Affairs.
-3. Type your UPSC question and click **Ask**.
-4. Ask follow-up questions — the chatbot remembers the conversation context.
-5. Click **Clear History** to start a fresh session.
+### 1. Query Endpoints
 
-### Example Multi-Turn Conversation
+#### `POST /api/v1/query` — Standard RAG Query
+Processes a question and returns a complete JSON response with citations and memory context.
 
-```
-You:  What is ISRO's Gaganyaan mission?
-Bot:  Gaganyaan is India's first human spaceflight programme...
-
-You:  What is its current status?
-Bot:  (automatically understands "its" = Gaganyaan)
-      As of the latest updates, ISRO completed the TV-D1 abort test...
+**Request Body:**
+```json
+{
+  "query": "Explain the major features of the Indus Valley Civilization urban planning.",
+  "mode": "prelims",
+  "session_id": "session_user_123"
+}
 ```
 
----
-
-## 🔍 Retrieval Modes
-
-| Mode | When Used | Source |
-|---|---|---|
-| **Prelims** | Factual, MCQ-style questions | Ingested PDF corpus |
-| **Mains** | Essay/analytical questions | Ingested PDF corpus |
-| **Current Affairs** | Recent news, schemes, events | Live web scraping |
-| **Web Fallback** | Out-of-domain or low-confidence | DuckDuckGo + SearXNG |
-
----
-
-## 📄 PDF Ingestion Engines
-
-| Engine | Endpoint | Best For |
-|---|---|---|
-| **Docling v2** (Local) | `POST /api/v1/documents` | Digital, selectable-text PDFs |
-| **Gemini Flash VLM** (Cloud) | `POST /api/v2/documents` | Scanned, multi-column, image PDFs |
-
-Both engines run through the same status pipeline:
-
-```
-registered → extracting → extracted → preprocessing → preprocessed → embedding → ingested
+**Response Body:**
+```json
+{
+  "answer": "The Indus Valley Civilization demonstrated advanced town planning characterized by...",
+  "sources": [
+    {
+      "source": "Ancient_History_NCERT.pdf",
+      "page": 42,
+      "score": 0.892
+    }
+  ],
+  "latency_ms": 780,
+  "cache_hit": false
+}
 ```
 
----
-
-## 📊 Extraction Quality
-
-Evaluated across **77 active UPSC PDFs**:
-
-| Metric | Result |
-|---|---|
-| Average Confidence Score | **95.9%** |
-| Page Coverage | **103.7%** (OCR fallback guaranteed) |
-| Documents ready for RAG | **77 / 77 (100%)** |
+#### `POST /api/v1/query/stream` — Real-Time SSE Stream
+Streams pipeline stages and real-time generation progress to the user interface.
 
 ---
 
-## ⚡ Performance Tuning
+### 2. Current Affairs & Multi-Mode Queries
 
-Adjust these `.env` variables to tune retrieval speed vs. quality:
+Under Current Affairs, select a specialized `sub_mode` to tailor the output:
 
-| Variable | Default | Effect |
-|---|---|---|
-| `RETRIEVAL_CANDIDATE_K` | `10` | Lower = faster reranking |
-| `RERANKER_MODEL_NAME` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Use MiniLM for CPU speed |
-| `LOW_CONFIDENCE_THRESHOLD` | `0.50` | Lower = fewer web searches |
+```json
+{
+  "query": "Recent Supreme Court judgment on Electoral Bonds",
+  "mode": "current_affairs",
+  "sub_mode": "mcq"  // Options: "summary" | "mains" | "mcq" | "explain"
+}
+```
+
+* **`summary`:** 3-bullet executive overview of the event with key takeaways.
+* **`mains`:** Structured 250-word analytical answer (Context $\rightarrow$ Pros/Cons/Issues $\rightarrow$ Way Forward).
+* **`mcq`:** 3–5 UPSC Prelims-style statement questions with answer key and rationale.
+* **`explain`:** Simple, beginner-friendly conceptual breakdown.
 
 ---
 
-## 🧪 Running Tests
+### 3. Document Ingestion Endpoints
 
-```bash
-# Run all 52 tests
-python -m pytest
+* **Digital PDFs:** `POST /api/v1/documents` — Parses digital PDFs using Docling layout analyzer.
+* **Scanned/Image PDFs:** `POST /api/v2/documents` — Parses scanned, low-contrast, or handwritten notes using Gemini VLM.
 
-# Run only conversation memory tests
-python -m pytest tests/test_conversation_memory.py -v
+---
 
-# Run only prompt routing tests
-python -m pytest tests/test_prompt_selection.py -v
+### 4. Admin & Cache Management
+
+* **`GET /api/v1/cache/stats`:** Returns live response cache metrics (live entries, memory size, TTL).
+* **`DELETE /api/v1/cache`:** Clears the entire response cache database.
+
+---
+
+## 🧪 Running Automated Tests
+
+Run the complete test suite (50+ tests covering memory, reranking, prompts, and cache):
+
+```powershell
+pytest tests/ -v
 ```
 
 ---
 
-## 🛠️ Tech Stack
-
-| Component | Technology |
-|---|---|
-| **API Framework** | FastAPI |
-| **Vector Database** | Qdrant |
-| **Relational Database** | PostgreSQL + SQLAlchemy |
-| **Embedding Model** | BAAI/bge-base-en-v1.5 (SentenceTransformers) |
-| **Reranker Model** | cross-encoder/ms-marco-MiniLM-L-6-v2 |
-| **LLM (Generation)** | Google Gemini / Groq (Llama 3.3) |
-| **PDF Extraction** | Docling v2 + Gemini Flash VLM |
-| **Web Search** | DuckDuckGo + SearXNG |
-| **Frontend** | Vanilla HTML + CSS + JavaScript |
+## 📄 License
+This project is licensed under the MIT License.

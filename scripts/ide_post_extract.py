@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 

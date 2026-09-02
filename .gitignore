@@ -23,8 +23,11 @@ Thumbs.db
 # Runtime / Data directories
 data/
 uploads/
+scratch/
+.pytest_cache/
 
 # Document files & page visual renders
 *.pdf
 *.png
+
 

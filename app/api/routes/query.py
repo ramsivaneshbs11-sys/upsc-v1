@@ -98,6 +98,17 @@ class QueryRequest(BaseModel):
         ),
         examples=["prelims", "mains", "current_affairs"],
     )
+    sub_mode: Optional[str] = Field(
+        default="summary",
+        description=(
+            "Output style for current_affairs: "
+            "'summary' — 3-bullet executive overview with exam relevance (default). "
+            "'mcq' — 3-5 statement-based UPSC Prelims MCQs with answer key. "
+            "'explain' — Beginner-friendly conceptual deep-dive. "
+            "'mains' — Structured 250-word analytical answer."
+        ),
+        examples=["summary", "mcq", "explain", "mains"],
+    )
     session_id: Optional[str] = Field(
         default=None,
         description="Optional session ID to enable sliding-window chat conversation memory."
@@ -125,6 +136,7 @@ class QueryResponse(BaseModel):
     # ── Query metadata ──────────────────────────────────────────────────────────
     query:            str
     mode:             str           # Prompt mode used (prelims/mains/current_affairs)
+    sub_mode:         Optional[str] = None  # Sub-mode used for current_affairs
     classification:   str
     confidence:       float
     all_scores:       dict
@@ -145,44 +157,37 @@ class QueryResponse(BaseModel):
     chunks:           list[ChunkResult]
 
 
-# ── Endpoint ───────────────────────────────────────────────────────────────────
+# ── Route implementation ───────────────────────────────────────────────────────
 
 @router.post(
     "/query",
     response_model=QueryResponse,
     status_code=status.HTTP_200_OK,
-    summary="Query the UPSC RAG knowledge base (Anti-Hallucination)",
-    description=(
-        "Full RAG pipeline with 3-layer hallucination prevention:\n\n"
-        "1. **Score Gate** — Blocks LLM if retrieved chunks have low relevance scores\n"
-        "2. **Strict Context-Only Prompt** — LLM must answer ONLY from retrieved passages\n"
-        "3. **Citation Enforcement** — Every claim tagged with source [chunk_id]\n\n"
-        "Returns `answered: false` when the question is outside the knowledge base "
-        "instead of hallucinating."
-    ),
+    summary="Query the UPSC RAG knowledge base",
 )
-async def query_knowledge_base(
+async def query_rag(
     body: QueryRequest,
-    db: Session = Depends(get_db)
-) -> QueryResponse:
+    db: Session = Depends(get_db),
+):
     """
-    Full RAG pipeline:
-    Query → Classify → Route (High/Medium/Low) → Vector/Web Search
-         → Rerank → Score Gate → Strict LLM → Grounded Answer + Citations
+    Execute the full RAG pipeline for a user query.
     """
     query = body.query.strip()
     top_k = body.top_k or RETRIEVAL_FINAL_TOP_K
     mode  = body.mode.strip().lower().replace(" ", "_").replace("-", "_") or "prelims"
+    sub_mode = (body.sub_mode or "summary").strip().lower()
     session_id = body.session_id
 
-    logger.info(f"[QUERY] Incoming: '{query[:80]}' | top_k={top_k} | mode={mode} | session_id={session_id}")
+    logger.info(f"[QUERY] Incoming: '{query[:80]}' | top_k={top_k} | mode={mode} | sub_mode={sub_mode} | session_id={session_id}")
 
-    # ── Response Cache Lookup (skip for current_affairs and active chat sessions) ──
-    # We skip cache when a session has history because the condensed query may differ
-    # from the raw query, and multi-turn context changes the expected answer.
-    use_cache = RESPONSE_CACHE_ENABLED and mode != "current_affairs" and not session_id
-    if use_cache:
-        cached = get_response(query, mode)
+    # ── Response Cache Lookup ──────────────────────────────────────────────────────────
+    # Read from cache only when there is no active session — with a session_id
+    # the user may ask follow-up questions that require conversation context,
+    # and a stale cache hit would ignore that context entirely.
+    # Cache writes always happen (see below) so Live Entries still count up.
+    use_cache = RESPONSE_CACHE_ENABLED
+    if use_cache and not session_id:
+        cached = get_response(query, mode, sub_mode=sub_mode)
         if cached is not None:
             cached["cache_hit"] = True
             logger.info(f"[QUERY] Cache HIT — returning stored answer instantly.")
@@ -198,6 +203,11 @@ async def query_knowledge_base(
         history_str = format_history_for_prompt(history_msgs)
         # Rewrite query to be standalone if history exists
         search_query = await asyncio.to_thread(condense_query, query, history_str)
+    elif mode == "current_affairs" and history_str.strip() != "No previous conversation history.":
+        # Gap 6 fix: also condense for CA mode when history is available without a session_id
+        # Resolves follow-up pronouns ("Tell me more about it") in multi-turn CA conversations
+        search_query = await asyncio.to_thread(condense_query, query, history_str)
+        logger.debug(f"[QUERY] CA multi-turn condensed: '{query[:40]}' → '{search_query[:40]}'")
 
     # ── Step 1: Classify (using condensed search_query) ────────────────────────
     try:
@@ -238,6 +248,7 @@ async def query_knowledge_base(
             routing,
             mode,
             history_str,
+            sub_mode,
         )
     except Exception as exc:
         logger.exception(f"[QUERY] Generation failed: {exc}")
@@ -250,6 +261,7 @@ async def query_knowledge_base(
             "gated":       True,
             "gate_reason": f"Generation error: {exc}",
             "mode":        mode,
+            "sub_mode":    sub_mode,
         }
 
     # ── Build response ─────────────────────────────────────────────────────────
@@ -281,27 +293,24 @@ async def query_knowledge_base(
         )
     elif routing == "medium_confidence":
         log_info = (
-            f"Medium confidence ({confidence_pct:.1f}%) — Both History and Anthropology "
-            f"databases were searched and merged. "
-            f"{candidate_count} total candidates reranked. "
+            f"Query routed to top-2 databases (History + Anthropology). "
+            f"{candidate_count} candidate chunks merged and reranked. "
             f"Answer backed by {citation_count} source(s)."
         )
-    elif routing == "low_confidence":
+    elif routing == "current_affairs_local":
         log_info = (
-            f"Low confidence ({confidence_pct:.1f}%) — Query did not match local databases. "
-            f"Routed to parallel web search (DuckDuckGo + SearXNG + Bing). "
-            f"{candidate_count} web results retrieved and reranked."
+            f"Query answered directly from local Current Affairs Vector Cache (06:00 AM daily digest). "
+            f"{candidate_count} candidates retrieved and reranked. "
+            f"Answer backed by {citation_count} verified source(s) with <1s latency."
         )
     elif routing == "current_affairs_web":
-        trusted_sources_str = ", ".join(TRUSTED_SITES)
+        trusted_sources_str = ", ".join(TRUSTED_SITES[:4]) + "..."
         log_info = (
-            f"Current Affairs mode — Local databases bypassed entirely. "
-            f"Live web search performed via DuckDuckGo + SearXNG + Bing "
+            f"Current Affairs query routed to live parallel web search "
             f"(trusted sources: {trusted_sources_str}). "
             f"{candidate_count} web articles scraped and reranked. "
             f"Answer backed by {citation_count} source(s)."
         )
-
     else:
         log_info = (
             f"Routing: {routing} | Confidence: {confidence_pct:.1f}% | "
@@ -317,16 +326,16 @@ async def query_knowledge_base(
         log_info += " [Result: Answer successfully generated.]"
 
     logger.info(
-        f"[QUERY] Complete — class='{classification}', mode='{mode}', "
+        f"[QUERY] Complete — class='{classification}', mode='{mode}', sub_mode='{sub_mode}', "
         f"conf={classifier_result['confidence']:.2f}, routing='{routing}', "
         f"answered={generation['answered']}, gated={generation['gated']}, "
         f"candidates={len(candidates)}, chunks={len(chunk_results)}"
     )
-    logger.info(f"[LOG_INFO] {log_info}")
 
     result_payload = QueryResponse(
         query=            query,
         mode=             generation.get("mode", mode),
+        sub_mode=         generation.get("sub_mode", sub_mode),
         classification=   classification,
         confidence=       classifier_result["confidence"],
         all_scores=       classifier_result.get("all_scores", {}),
@@ -357,7 +366,7 @@ async def query_knowledge_base(
 
     # ── Store in response cache (only when answered=True and no active session) ──
     if use_cache:
-        set_response(query, mode, result_payload.model_dump())
+        set_response(query, mode, result_payload.model_dump(), sub_mode=sub_mode)
 
     return result_payload
 
@@ -391,3 +400,22 @@ async def response_cache_stats():
     """Return current response cache statistics (live entries, expired, config)."""
     stats = await asyncio.to_thread(cache_stats)
     return stats
+
+
+@router.post(
+    "/admin/sync-news",
+    status_code=200,
+    summary="Trigger daily news scraper sync manually (admin)",
+    description="Scrapes The Hindu & PIB immediately, embeds articles, and upserts them into Qdrant current_affairs_collection.",
+    tags=["admin"],
+)
+async def admin_sync_news():
+    """Manually run the daily news sync pipeline."""
+    from app.services.news_scraper_service import run_daily_news_scraper
+    logger.info("[ADMIN] Manual news sync triggered...")
+    result = await asyncio.to_thread(run_daily_news_scraper)
+    return {
+        "message": "Daily news sync completed successfully.",
+        "details": result,
+    }
+

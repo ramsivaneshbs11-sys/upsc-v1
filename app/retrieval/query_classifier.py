@@ -26,7 +26,6 @@ import logging
 import re
 import numpy as np
 import requests
-import google.generativeai as genai
 
 from app.core.config import (
     ALLOWED_CLASSIFICATIONS,
@@ -78,6 +77,8 @@ _SUBJECT_ANCHORS: dict[str, list[str]] = {
         "Totemism animism tribal religion magic shamanism sorcery witchcraft ritual belief",
         "Functionalism structuralism cultural materialism anthropological theory Boas Malinowski",
         "Somatoscopy dermatoglyphics blood groups genetic markers human genetics physical traits",
+        "ABO blood group system Rh factor universal donor universal recipient Landsteiner serology blood transfusion",
+        "Biological physical anthropology human genetics Mendelian inheritance ABO polymorphism Hardy Weinberg",
     ],
 }
 

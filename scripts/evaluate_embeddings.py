@@ -13,11 +13,16 @@ import math
 import json
 import logging
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from app.core.config import BASE_DIR
 

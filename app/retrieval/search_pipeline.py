@@ -387,21 +387,49 @@ def clean_query_for_search(query: str) -> str:
     return q.strip()
 
 
-def _chunk_article_text(text: str, max_words: int = 150, overlap_words: int = 40) -> list[str]:
+def _clean_snippet_artifacts(text: str) -> str:
+    """Clean broken web snippet ellipsis artifacts like 'Ne... afe' or 'word... word'."""
+    import re
+    # Remove broken mid-word ellipsis like 'Ne... afe' -> 'Nepal safe' or 'Ne safe'
+    cleaned = re.sub(r'(\b[A-Za-z]{2,})\s*\.\.\.\s*([A-Za-z]{2,}\b)', r'\1 \2', text)
+    # Remove standalone ellipses
+    cleaned = re.sub(r'\s*\.\.\.\s*', ' ', cleaned)
+    return cleaned.strip()
+
+
+def _chunk_article_text(text: str, max_words: int = 250, overlap_words: int = 50) -> list[str]:
     """
-    Split text into overlapping chunks at word boundaries to fit LLM/Reranker context windows.
+    Split text into overlapping chunks at sentence boundaries to preserve complete facts.
     """
-    words = text.split()
+    import re
+    cleaned_text = _clean_snippet_artifacts(text)
+    words = cleaned_text.split()
     if len(words) <= max_words:
-        return [text]
-        
+        return [cleaned_text]
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', cleaned_text)
     chunks = []
-    i = 0
-    while i < len(words):
-        chunk_words = words[i:i + max_words]
-        chunks.append(" ".join(chunk_words))
-        i += max_words - overlap_words
-    return chunks
+    current_chunk = []
+    current_word_count = 0
+
+    for sentence in sentences:
+        s_words = sentence.split()
+        s_count = len(s_words)
+
+        if current_word_count + s_count > max_words and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            # Keep last sentence for overlap
+            current_chunk = [current_chunk[-1]] if len(current_chunk) > 1 else []
+            current_word_count = sum(len(s.split()) for s in current_chunk)
+
+        current_chunk.append(sentence)
+        current_word_count += s_count
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks if chunks else [cleaned_text]
 
 
 # ── Parallel orchestrator ──────────────────────────────────────────────────────

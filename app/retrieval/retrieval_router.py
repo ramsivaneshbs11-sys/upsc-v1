@@ -20,6 +20,7 @@ from typing import Any
 
 from app.core.config import (
     QDRANT_COLLECTION_MAP,
+    CA_NEWS_COLLECTION,
     HIGH_CONFIDENCE_THRESHOLD,
     LOW_CONFIDENCE_THRESHOLD,
     RETRIEVAL_CANDIDATE_K,
@@ -73,14 +74,14 @@ def route_and_retrieve(
 
     Returns:
         dict with:
-            routing    (str)       — "high_confidence" / "medium_confidence" / "low_confidence"
+            routing    (str)       — "high_confidence" / "medium_confidence" / "low_confidence" / "current_affairs_local" / "current_affairs_web"
             candidates (list[dict])— raw candidates before reranking
             chunks     (list[dict])— top-K reranked chunks
             mode       (str)       — prompt mode forwarded from caller
     """
     # ── Dynamic mode-specific top_k ──────────────────────────────────────────
     # Prelims  → 5 chunks  (sharp factual precision, fastest)
-    # Current Affairs → 8 chunks  (multi-source web coverage)
+    # Current Affairs → 8 chunks  (multi-source web/local coverage)
     # Mains    → 10 chunks (broad analytical context for multi-dimensional answers)
     if top_k is None:
         if mode == "mains":
@@ -90,27 +91,51 @@ def route_and_retrieve(
         else:  # prelims (default)
             top_k = RETRIEVAL_FINAL_TOP_K
 
-    # ── Current Affairs Mode: Bypass Classifier → Direct Web Search ───────────
-    # Local Qdrant collections only contain static textbook PDFs (History /
-    # Anthropology). They cannot answer questions about recent events.
-    # When mode="current_affairs", skip confidence routing entirely and go
-    # straight to the parallel web search pipeline.
+    # ── Current Affairs Mode: Local Qdrant First → Web Search Fallback ────────
     if mode == "current_affairs":
         logger.info(
-            f"Router: mode='current_affairs' → Bypassing classifier. "
-            f"Forcing parallel web search (DuckDuckGo + SearXNG)."
+            f"Router: mode='current_affairs' → Checking local '{CA_NEWS_COLLECTION}' first..."
         )
-        candidates = parallel_search(user_query=query)
-        top_chunks  = rerank(query=query, candidates=candidates, top_k=top_k)
-        # Web search chunks don't have sub_chunk_index so expand_with_siblings is a no-op here.
-        # Included for consistency in case future web-cached chunks adopt the same metadata.
+        candidates = []
+        routing = "current_affairs_web"
+
+        # 1. Try pre-scraped daily news collection in local Qdrant
+        try:
+            local_candidates = search_collections(
+                query=query,
+                collection_names=[CA_NEWS_COLLECTION],
+                top_k=RETRIEVAL_CANDIDATE_K * 2,
+            )
+            # Accuracy fix: lower threshold 0.50→0.40 (news chunks score lower due to noisy text)
+            # Require at least 2 candidates above threshold to avoid false positives
+            high_score_count = sum(1 for c in local_candidates if c.get("score", 0.0) >= 0.40)
+            if local_candidates and high_score_count >= 2:
+                candidates = local_candidates
+                routing = "current_affairs_local"
+                best_score = max(c.get("score", 0.0) for c in candidates)
+                logger.info(
+                    f"Router: [current_affairs] Found {len(candidates)} candidates in local Qdrant "
+                    f"(best score: {best_score:.3f}, qualifying: {high_score_count}) ✓"
+                )
+        except Exception as exc:
+            logger.warning(f"Router: Error querying local CA collection: {exc}")
+
+        # 2. If not found in local news collection, fallback to live parallel web search
+        if not candidates:
+            logger.info(
+                f"Router: [current_affairs] Not in local cache. Running parallel web search (DDG + SearXNG)..."
+            )
+            candidates = parallel_search(user_query=query)
+            routing = "current_affairs_web"
+
+        top_chunks = rerank(query=query, candidates=candidates, top_k=top_k)
         top_chunks = expand_with_siblings(top_chunks, PREPROCESSED_DIR)
+
         logger.info(
-            f"Router: [current_affairs] candidates={len(candidates)}, "
-            f"top_k={len(top_chunks)}"
+            f"Router: [current_affairs] routing='{routing}', candidates={len(candidates)}, top_k={len(top_chunks)}"
         )
         return {
-            "routing":    "current_affairs_web",
+            "routing":    routing,
             "candidates": candidates,
             "chunks":     top_chunks,
             "mode":       mode,
@@ -153,27 +178,92 @@ def route_and_retrieve(
             top_k=RETRIEVAL_CANDIDATE_K,
         )
 
-    # ── Route: Low Confidence — Parallel Web Search (DDG + SearXNG) ────────────
+    # ── Route: Low Confidence — Check Local Collections First, then Web ────────
     else:
-        routing = "low_confidence"
-
+        routing = "low_confidence_local"
+        all_collections = list(QDRANT_COLLECTION_MAP.values())
         logger.info(
             f"Router: LOW confidence ({confidence:.2f}) → "
-            f"Parallel web search (DuckDuckGo + SearXNG)"
+            f"Searching all local collections first: {all_collections}"
+        )
+        candidates = search_collections(
+            query=query,
+            collection_names=all_collections,
+            top_k=RETRIEVAL_CANDIDATE_K,
         )
 
-        candidates = parallel_search(user_query=query)
+        # If local collections returned candidates, test them with reranker
+        if candidates:
+            top_chunks = rerank(query=query, candidates=candidates, top_k=top_k)
+            best_local_score = max((c.get("rerank_score", -999) for c in top_chunks), default=-999)
+            if best_local_score >= 0.0:
+                logger.info(f"Router: Low confidence local search found relevant match (score: {best_local_score:.3f})")
+            else:
+                logger.info(f"Router: Local collections score too low ({best_local_score:.3f}). Trying web search fallback...")
+                web_candidates = parallel_search(user_query=query)
+                if web_candidates:
+                    web_chunks = rerank(query=query, candidates=web_candidates, top_k=top_k)
+                    web_best = max((c.get("rerank_score", -999) for c in web_chunks), default=-999)
+                    if web_best > best_local_score:
+                        candidates = web_candidates
+                        top_chunks = web_chunks
+                        routing = "low_confidence_web"
+        else:
+            logger.info("Router: No local candidates found. Running parallel web search...")
+            candidates = parallel_search(user_query=query)
+            top_chunks = rerank(query=query, candidates=candidates, top_k=top_k)
+            routing = "low_confidence_web"
 
-    # ── Rerank candidates → Top-K ──────────────────────────────────────────────
-    top_chunks = rerank(
-        query=query,
-        candidates=candidates,
-        top_k=top_k,
-    )
+    # ── Rerank candidates → Top-K (for high/medium routes) ────────────────────
+    if routing in ("high_confidence", "medium_confidence"):
+        top_chunks = rerank(
+            query=query,
+            candidates=candidates,
+            top_k=top_k,
+        )
+
+    # ── Cross-Collection Fallback ─────────────────────────────────────────────
+    # If high/medium confidence routing returns all-negative rerank scores
+    # (i.e. the classifier misrouted the query), retry with ALL collections
+    # before triggering the score gate. This handles edge cases where a topic
+    # belongs to a different collection than the classifier predicted.
+    # Example: "Systema Naturae" → classified as History, but exists in Anthropology.
+    FALLBACK_THRESHOLD = 0.0
+    if routing in ("high_confidence", "medium_confidence"):
+        best_score = max((c.get("rerank_score", -999) for c in top_chunks), default=-999)
+        if best_score < FALLBACK_THRESHOLD:
+            all_collections = list(QDRANT_COLLECTION_MAP.values())
+            searched = set(collections)
+            remaining = [c for c in all_collections if c not in searched]
+            if remaining:
+                logger.info(
+                    f"Router: Cross-collection fallback — best score={best_score:.3f} < {FALLBACK_THRESHOLD}. "
+                    f"Searching remaining collections: {remaining}"
+                )
+                fallback_candidates = search_collections(
+                    query=query,
+                    collection_names=remaining,
+                    top_k=RETRIEVAL_CANDIDATE_K,
+                )
+                if fallback_candidates:
+                    fallback_chunks = rerank(
+                        query=query,
+                        candidates=fallback_candidates,
+                        top_k=top_k,
+                    )
+                    fallback_best = max(
+                        (c.get("rerank_score", -999) for c in fallback_chunks), default=-999
+                    )
+                    if fallback_best > best_score:
+                        logger.info(
+                            f"Router: Fallback improved score {best_score:.3f} → {fallback_best:.3f}. "
+                            f"Using fallback chunks."
+                        )
+                        top_chunks = fallback_chunks
+                        candidates = fallback_candidates
+                        routing = f"{routing}_cross_collection_fallback"
 
     # ── Sibling Expansion: inject next consecutive sub-chunk if split ───────────
-    # Guarantees complete lists/sections reach the LLM when a dense page was
-    # split across sub-chunks during ingestion. No re-ingestion required.
     top_chunks = expand_with_siblings(top_chunks, PREPROCESSED_DIR)
 
     logger.info(

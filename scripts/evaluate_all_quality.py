@@ -29,7 +29,7 @@ from typing import Dict, Any, List
 
 import fitz  # PyMuPDF
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from extraction.document_validator import validate_pdf, audit_extraction

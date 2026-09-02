@@ -33,8 +33,11 @@ from app.database import classification_models  # noqa: F401 — registers Class
 from app.api.routes import documents
 from app.api.routes import extract_page as extract_page_v2
 from app.api.routes import query as query_route
-from app.api.routes import classifications as classification_route  # NEW — dynamic classification management
+from app.api.routes import classifications as classification_route  # dynamic classification management
 from app.api.routes import query_stream as query_stream_route       # SSE streaming endpoint
+from app.api.routes import news as news_route                       # Daily news endpoints
+from app.api.routes import mcq as mcq_route                         # MCQ practice endpoints
+from app.api.routes import admin as admin_route                     # Admin cache & storage endpoints
 from app.services.qdrant_service import ensure_collections
 from app.core.config import (
     RESPONSE_CACHE_ENABLED,
@@ -85,8 +88,32 @@ async def lifespan(app: FastAPI):
         f"(enabled={RESPONSE_CACHE_ENABLED}, ttl={RESPONSE_CACHE_TTL_SECONDS}s)"
     )
 
+    # ── Start Daily News Scraper Scheduler (06:00 AM) ─────────────────────
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from app.services.news_scraper_service import run_daily_news_scraper
+    from app.core.config import NEWS_SCRAPER_CRON_HOUR, NEWS_SCRAPER_CRON_MINUTE
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        run_daily_news_scraper,
+        "cron",
+        hour=NEWS_SCRAPER_CRON_HOUR,
+        minute=NEWS_SCRAPER_CRON_MINUTE,
+        id="daily_news_scraper",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info(
+        f"Daily news scraper scheduled at {NEWS_SCRAPER_CRON_HOUR:02d}:{NEWS_SCRAPER_CRON_MINUTE:02d} daily ✓"
+    )
+
     yield
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     logger.info("Shutting down …")
+
 
 
 
@@ -170,8 +197,13 @@ app.include_router(extract_page_v2.router)
 # Retrieval
 app.include_router(query_route.router)
 app.include_router(query_stream_route.router)   # SSE streaming variant
-# Classification Management (NEW — dynamic classification registration)
+# Classification Management
 app.include_router(classification_route.router)
+# Daily News & MCQ (merged from ram_chatbot-main)
+app.include_router(news_route.router)
+app.include_router(mcq_route.router)
+# Admin — Cache & Storage Management
+app.include_router(admin_route.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────

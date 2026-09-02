@@ -50,6 +50,7 @@ class StreamQueryRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=1000)
     top_k: Optional[int] = Field(default=None, ge=1, le=50)
     mode: str = Field(default="prelims")
+    sub_mode: Optional[str] = Field(default="summary")
     session_id: Optional[str] = Field(default=None)
 
 
@@ -70,6 +71,7 @@ async def _stream_pipeline(
     query: str,
     top_k: Optional[int],
     mode: str,
+    sub_mode: str = "summary",
     session_id: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> AsyncGenerator[str, None]:
@@ -79,12 +81,15 @@ async def _stream_pipeline(
     so the event loop is never blocked and SSE events are delivered immediately.
     """
 
-    # ── Cache Fast-Path (skip for current_affairs and active sessions) ────────────
-    # A cache hit instantly emits one progress + result + done event in <1ms
-    # instead of running the full 4-stage pipeline.
-    use_cache = RESPONSE_CACHE_ENABLED and mode != "current_affairs" and not session_id
-    if use_cache:
-        cached = await asyncio.to_thread(get_response, query, mode)
+    # ── Cache Fast-Path ───────────────────────────────────────────────────────
+    # Read from cache ONLY when there is no active session.
+    # With a session_id, the user may be asking follow-up questions like
+    # "tell me more" that depend on conversation history — returning a stale
+    # cache hit would completely ignore that context and give a wrong answer.
+    # We still WRITE to cache after generation (see below) so Live Entries grow.
+    use_cache = RESPONSE_CACHE_ENABLED
+    if use_cache and not session_id:
+        cached = await asyncio.to_thread(get_response, query, mode, sub_mode=sub_mode)
         if cached is not None:
             cached["cache_hit"] = True
             logger.info(f"[STREAM] Cache HIT — short-circuiting pipeline for: '{query[:60]}'")
@@ -94,68 +99,60 @@ async def _stream_pipeline(
             return
 
     # ── Stage 0: Load History & Condense Query ────────────────────────────────
-    yield _progress("classifying", "🔍 Loading conversation history and condensing query...")
     history_str = "No previous conversation history."
     search_query = query
 
     if session_id and db is not None:
         history_msgs = await asyncio.to_thread(get_session_history, db, session_id, limit=10)
         history_str = format_history_for_prompt(history_msgs)
-        search_query = await asyncio.to_thread(condense_query, query, history_str)
+        # Only condense if there is actual history (skip extra Gemini call on first-turn)
+        if history_str and history_str != "No previous conversation history.":
+            search_query = await asyncio.to_thread(condense_query, query, history_str)
 
-    # ── Stage 1: Classify ──────────────────────────────────────────────────────
-    yield _progress("classifying", "🔍 Classifying your query...")
+    # ── Stage 1: Classify Query ───────────────────────────────────────────────
+    yield _progress("classifying", "🏷️ Classifying query intent & syllabus scope...")
     try:
         classifier_result = await asyncio.to_thread(classify_query, search_query)
     except Exception as exc:
-        yield _sse({"type": "error", "message": f"Classification failed: {exc}"})
+        logger.exception(f"[STREAM] Classification failed: {exc}")
+        yield _sse({"type": "error", "message": f"Query classification failed: {exc}"})
+        yield _sse({"type": "done"})
         return
 
-    # ── Stage 2: Search ────────────────────────────────────────────────────────
-    yield _progress("searching", "🌐 Searching trusted sources across the web...")
+    # ── Stage 2: Route & Search ───────────────────────────────────────────────
+    routing_msg = "🔍 Searching relevant knowledge base..."
+    if mode == "current_affairs":
+        routing_msg = "🌐 Searching current affairs collection & trusted sources..."
+    elif classifier_result.get("confidence", 0) >= 0.80:
+        routing_msg = f"📚 Searching {classifier_result.get('classification', 'UPSC')} collection in Qdrant..."
+    yield _progress("searching", routing_msg)
 
-    # We run retrieval in a thread; but we want to emit "scraping" mid-way.
-    # We achieve this by emitting the scraping event just before retrieval
-    # returns (retrieval itself handles search+scrape internally).
-    # A secondary delayed emit gives the user visible progress during scraping.
-    async def _emit_scraping_after_delay():
-        await asyncio.sleep(3.5)          # ~time for search providers to respond
-        return _progress("scraping", "📄 Analysing articles from PIB, The Hindu, Wikipedia...")
-
-    scraping_task = asyncio.create_task(_emit_scraping_after_delay())
-
-    # Run the heavy retrieval pipeline in a thread pool
-    retrieval_task = asyncio.to_thread(
-        route_and_retrieve,
-        search_query,
-        classifier_result,
-        top_k,
-        mode,
-    )
-
-    retrieval_result, scraping_msg = await asyncio.gather(
-        retrieval_task,
-        scraping_task,
-        return_exceptions=True,
-    )
-
-    # Emit scraping message if retrieval hadn't already finished by then
-    if isinstance(scraping_msg, str):
-        yield scraping_msg
-
-    if isinstance(retrieval_result, Exception):
-        yield _sse({"type": "error", "message": f"Retrieval failed: {retrieval_result}"})
+    try:
+        retrieval_result = await asyncio.to_thread(
+            route_and_retrieve,
+            search_query,
+            classifier_result,
+            top_k,
+            mode,
+        )
+    except Exception as exc:
+        logger.exception(f"[STREAM] Retrieval failed: {exc}")
+        yield _sse({"type": "error", "message": f"Retrieval failed: {exc}"})
+        yield _sse({"type": "done"})
         return
 
     chunks     = retrieval_result["chunks"]
     candidates = retrieval_result["candidates"]
     routing    = retrieval_result["routing"]
 
-    # ── Stage 3: Reranking done (already part of retrieval) ───────────────────
-    yield _progress("reranking", f"⚡ Ranked {len(chunks)} relevant chunks...")
+    # ── Stage 3: Reranking Progress ───────────────────────────────────────────
+    yield _progress(
+        "reranking",
+        f"⚡ Scored {len(candidates)} candidates → top {len(chunks)} high-relevance chunks selected."
+    )
 
-    # ── Stage 4: Generate ──────────────────────────────────────────────────────
-    yield _progress("generating", "✍️ Generating grounded answer...")
+    # ── Stage 4: Generation ───────────────────────────────────────────────────
+    yield _progress("generating", "✍️ Synthesizing grounded answer with citations...")
     try:
         generation = await asyncio.to_thread(
             generate_grounded_answer,
@@ -164,17 +161,19 @@ async def _stream_pipeline(
             routing,
             mode,
             history_str,
+            sub_mode,
         )
     except Exception as exc:
         logger.exception(f"[STREAM] Generation failed: {exc}")
         generation = {
-            "answer":        "Answer generation temporarily unavailable.",
-            "answered":      False,
-            "citations":     [],
+            "answer":      "Answer generation temporarily unavailable.",
+            "answered":    False,
+            "citations":   [],
             "rich_citations": [],
-            "gated":         True,
-            "gate_reason":   f"Generation error: {exc}",
-            "mode":          mode,
+            "gated":       True,
+            "gate_reason": f"Generation error: {exc}",
+            "mode":        mode,
+            "sub_mode":    sub_mode,
         }
 
     # ── Build final result payload ─────────────────────────────────────────────
@@ -184,12 +183,18 @@ async def _stream_pipeline(
     citation_count  = len(generation.get("citations", []))
     candidate_count = len(candidates)
 
-    if routing == "current_affairs_web":
-        trusted_sources_str = ", ".join(TRUSTED_SITES[:5]) + "..."
+    if routing == "current_affairs_local":
         log_info = (
-            f"Current Affairs mode — Live web search via DuckDuckGo + SearXNG + Bing "
-            f"(trusted: {trusted_sources_str}). "
-            f"{candidate_count} articles scraped and reranked. "
+            f"Query answered directly from local Current Affairs Vector Cache (06:00 AM daily digest). "
+            f"{candidate_count} candidates retrieved and reranked. "
+            f"Answer backed by {citation_count} verified source(s) with <1s latency."
+        )
+    elif routing == "current_affairs_web":
+        trusted_sources_str = ", ".join(TRUSTED_SITES[:4]) + "..."
+        log_info = (
+            f"Current Affairs query routed to live parallel web search "
+            f"(trusted sources: {trusted_sources_str}). "
+            f"{candidate_count} web articles scraped and reranked. "
             f"Answer backed by {citation_count} source(s)."
         )
     elif routing == "high_confidence":
@@ -214,6 +219,7 @@ async def _stream_pipeline(
     result_payload = {
         "query":            query,
         "mode":             generation.get("mode", mode),
+        "sub_mode":         generation.get("sub_mode", sub_mode),
         "classification":   classification,
         "confidence":       confidence,
         "all_scores":       classifier_result.get("all_scores", {}),
@@ -252,9 +258,11 @@ async def _stream_pipeline(
         })
         await asyncio.to_thread(save_chat_message, db, session_id, "assistant", response_json)
 
-    # ── Write to response cache (only on success, no session, not current_affairs) ─
+    # ── Write to response cache (always when enabled and answer was generated) ──
+    # Writing regardless of session_id means future standalone queries for the
+    # same question get instant cache hits, and Live Entries count up correctly.
     if use_cache:
-        await asyncio.to_thread(set_response, query, mode, result_payload)
+        await asyncio.to_thread(set_response, query, mode, result_payload, sub_mode=sub_mode)
 
     yield _sse({"type": "done"})
     logger.info(
@@ -287,12 +295,13 @@ async def stream_query(
     query = body.query.strip()
     top_k = body.top_k
     mode  = body.mode.strip().lower().replace(" ", "_").replace("-", "_") or "prelims"
+    sub_mode = (body.sub_mode or "summary").strip().lower()
     session_id = body.session_id
 
-    logger.info(f"[STREAM] Incoming: '{query[:80]}' | top_k={top_k} | mode={mode} | session_id={session_id}")
+    logger.info(f"[STREAM] Incoming: '{query[:80]}' | top_k={top_k} | mode={mode} | sub_mode={sub_mode} | session_id={session_id}")
 
     return StreamingResponse(
-        _stream_pipeline(query, top_k, mode, session_id, db),
+        _stream_pipeline(query, top_k, mode, sub_mode, session_id, db),
         media_type="text/event-stream",
         headers={
             "Cache-Control":  "no-cache",
@@ -300,3 +309,4 @@ async def stream_query(
             "Connection":     "keep-alive",
         },
     )
+

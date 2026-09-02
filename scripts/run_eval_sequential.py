@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 # Add workspace directory to path
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 import evaluate_embeddings

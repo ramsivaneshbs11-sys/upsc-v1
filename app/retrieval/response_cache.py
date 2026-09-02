@@ -34,20 +34,27 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ── Modes that are eligible for caching ────────────────────────────────────────
-CACHEABLE_MODES: frozenset[str] = frozenset({"prelims", "mains"})
+CACHEABLE_MODES: frozenset[str] = frozenset({"prelims", "mains", "current_affairs"})
 
-# ── Module-level config (populated by init_cache) ──────────────────────────────
-_db_path: Path | None      = None
-_ttl_seconds: int          = 604_800   # 7 days
-_max_entries: int          = 1_000
-_enabled: bool             = True
+from app.core.config import (
+    RESPONSE_CACHE_ENABLED,
+    RESPONSE_CACHE_TTL_SECONDS,
+    RESPONSE_CACHE_MAXSIZE,
+    RESPONSE_CACHE_SQLITE_PATH,
+)
+
+# ── Module-level config (auto-initialized with config defaults) ────────────────
+_db_path: Path             = Path(RESPONSE_CACHE_SQLITE_PATH)
+_ttl_seconds: int          = int(RESPONSE_CACHE_TTL_SECONDS)
+_max_entries: int          = int(RESPONSE_CACHE_MAXSIZE)
+_enabled: bool             = bool(RESPONSE_CACHE_ENABLED)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _cache_key(query: str, mode: str) -> str:
-    """Stable sha256 key from normalised query + mode."""
-    raw = f"{query.strip().lower()}|{mode.strip().lower()}"
+def _cache_key(query: str, mode: str, sub_mode: str = "") -> str:
+    """Stable sha256 key from normalised query + mode + sub_mode."""
+    raw = f"{query.strip().lower()}|{mode.strip().lower()}|{sub_mode.strip().lower()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -98,9 +105,13 @@ def init_cache(
     """
     global _db_path, _ttl_seconds, _max_entries, _enabled
     _db_path     = Path(db_path)
-    _ttl_seconds = ttl_seconds
-    _max_entries = max_entries
-    _enabled     = enabled
+    _ttl_seconds = int(ttl_seconds)
+    _max_entries = int(max_entries)
+    _enabled     = bool(enabled)
+
+    if not _enabled:
+        logger.info("Response cache is DISABLED.")
+        return
 
     _db_path.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
@@ -113,7 +124,7 @@ def init_cache(
     )
 
 
-def get_response(query: str, mode: str) -> dict[str, Any] | None:
+def get_response(query: str, mode: str, sub_mode: str = "") -> dict[str, Any] | None:
     """
     Look up a cached response.
 
@@ -124,7 +135,7 @@ def get_response(query: str, mode: str) -> dict[str, Any] | None:
     if not _enabled or mode not in CACHEABLE_MODES:
         return None
 
-    key = _cache_key(query, mode)
+    key = _cache_key(query, mode, sub_mode)
     now = time.time()
 
     try:
@@ -141,10 +152,10 @@ def get_response(query: str, mode: str) -> dict[str, Any] | None:
 
         if row:
             payload = json.loads(row[0])
-            logger.info(f"[ResponseCache] HIT — query='{query[:60]}' mode='{mode}'")
+            logger.info(f"[ResponseCache] HIT — query='{query[:60]}' mode='{mode}' sub_mode='{sub_mode}'")
             return payload
 
-        logger.debug(f"[ResponseCache] MISS — query='{query[:60]}' mode='{mode}'")
+        logger.debug(f"[ResponseCache] MISS — query='{query[:60]}' mode='{mode}' sub_mode='{sub_mode}'")
         return None
 
     except Exception as exc:
@@ -152,7 +163,7 @@ def get_response(query: str, mode: str) -> dict[str, Any] | None:
         return None
 
 
-def set_response(query: str, mode: str, payload: dict[str, Any]) -> None:
+def set_response(query: str, mode: str, payload: dict[str, Any], sub_mode: str = "") -> None:
     """
     Store a response in the cache.
 
@@ -170,9 +181,11 @@ def set_response(query: str, mode: str, payload: dict[str, Any]) -> None:
         )
         return
 
-    key     = _cache_key(query, mode)
+    key     = _cache_key(query, mode, sub_mode)
     now     = time.time()
-    expires = now + _ttl_seconds
+    # 6-hour TTL for current_affairs, 7-day TTL for static prelims/mains
+    effective_ttl = 21_600 if mode == "current_affairs" else _ttl_seconds
+    expires = now + effective_ttl
 
     try:
         with _connect() as conn:

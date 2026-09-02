@@ -30,9 +30,13 @@ QDRANT_PORT: int = int(os.environ.get("QDRANT_PORT", "6333"))
 
 # One Qdrant collection per classification (lowercase)
 QDRANT_COLLECTION_MAP: dict[str, str] = {
-    "History": "history_collection",
-    "Anthropology": "anthropology_collection",
+    "History":        "history_collection",
+    "Anthropology":   "anthropology_collection",
+    "CurrentAffairs": "current_affairs_collection",  # Daily news + live web articles
 }
+
+# ── Current Affairs Collection name shorthand ─────────────────────────────
+CA_NEWS_COLLECTION: str = "current_affairs_collection"
 
 # ── Embedding model ────────────────────────────────────────────────────────
 EMBEDDING_MODEL_NAME: str = os.environ.get(
@@ -40,28 +44,44 @@ EMBEDDING_MODEL_NAME: str = os.environ.get(
 )
 EMBEDDING_DIMENSION: int = 768  # Output dimension of BAAI/bge-base-en-v1.5
 
-# ── Gemini 2.5 Flash (Endpoint 2) ────────────────────────────────────────────────
+# ── Gemini (Endpoint 2) ──────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL:   str = "gemini-3.5-flash"
 
 # ── Groq API (Alternative Generation Layer) ──────────────────────────────────────
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL:   str = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")  # verified available on this key
+GROQ_MODEL:   str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 
 # ── Retrieval Layer ────────────────────────────────────────────────────────────
 # Confidence thresholds for routing (see retrieval_layer_query_classification.md)
-HIGH_CONFIDENCE_THRESHOLD: float = float(os.environ.get("HIGH_CONFIDENCE_THRESHOLD", "0.80"))
+# Lowered HIGH from 0.80→0.70: Groq temperature=0.0 returns 0.55-0.68 for clear subject
+# queries (e.g. "Indus Valley" → 0.56) which were incorrectly treated as medium_confidence.
+HIGH_CONFIDENCE_THRESHOLD: float = float(os.environ.get("HIGH_CONFIDENCE_THRESHOLD", "0.70"))
 LOW_CONFIDENCE_THRESHOLD:  float = float(os.environ.get("LOW_CONFIDENCE_THRESHOLD",  "0.50"))
 
 # Number of candidate chunks sent to the reranker (first-stage retrieval)
-RETRIEVAL_CANDIDATE_K: int = int(os.environ.get("RETRIEVAL_CANDIDATE_K", "10"))
+RETRIEVAL_CANDIDATE_K: int = int(os.environ.get("RETRIEVAL_CANDIDATE_K", "15"))
 # Number of final chunks returned after reranking (second-stage)
-RETRIEVAL_FINAL_TOP_K: int = int(os.environ.get("RETRIEVAL_FINAL_TOP_K", "5"))
+RETRIEVAL_FINAL_TOP_K: int = int(os.environ.get("RETRIEVAL_FINAL_TOP_K", "8"))
 
 # Cross-encoder model for reranking (MiniLM-L-6-v2 is used for fast CPU retrieval)
 RERANKER_MODEL_NAME: str = os.environ.get(
     "RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
+
+# ── Bidirectional Sibling Expansion ────────────────────────────────────────────
+# How many chunks to expand in BOTH directions from a matched chunk.
+# Radius=1 → fetches [N-1, N, N+1]   (default, safe for most queries)
+# Radius=2 → fetches [N-2, N-1, N, N+1, N+2] (useful for long tables/lists)
+# Keep low (1-2) to avoid sending too much irrelevant context to the LLM.
+SIBLING_EXPANSION_RADIUS: int = int(os.environ.get("SIBLING_EXPANSION_RADIUS", "1"))
+
+# Score decay per hop from the matched chunk (0.0 = no decay, 1.0 = zero score)
+# Sibling scores are reduced so the reranker/LLM still prioritises the exact match.
+# e.g. radius=2: hop-1 score = original * (1 - 0.15) = 0.85x
+#                hop-2 score = original * (1 - 0.15)^2 = 0.72x
+SIBLING_SCORE_DECAY: float = float(os.environ.get("SIBLING_SCORE_DECAY", "0.15"))
 
 # ── Article Cache (for Current Affairs web scraping) ─────────────────────────
 # Backend: "memory" (LRU, zero-dep), "sqlite" (persistent), or "redis" (networked)
@@ -118,9 +138,18 @@ TRUSTED_SITES: list[str] = [
     if s.strip()
 ]
 # Max results to fetch from each search provider per query
-SEARCH_MAX_RESULTS: int = int(os.environ.get("SEARCH_MAX_RESULTS", "15"))
+SEARCH_MAX_RESULTS: int = int(os.environ.get("SEARCH_MAX_RESULTS", "8"))
 # SearXNG public instance URL (can be overridden with self-hosted instance)
 SEARXNG_URL: str = os.environ.get("SEARXNG_URL", "https://searx.be/search")
+
+# ── Daily News Scraper ────────────────────────────────────────────────────────
+# Cron schedule for automated news ingestion (default: 06:00 AM daily)
+NEWS_SCRAPER_CRON_HOUR:   int = int(os.environ.get("NEWS_SCRAPER_CRON_HOUR",   "6"))
+NEWS_SCRAPER_CRON_MINUTE: int = int(os.environ.get("NEWS_SCRAPER_CRON_MINUTE", "0"))
+# How many days of news to retain in current_affairs_collection (rolling window)
+NEWS_RETENTION_DAYS: int = int(os.environ.get("NEWS_RETENTION_DAYS", "365"))
+# Max articles fetched per news source per run
+NEWS_MAX_ARTICLES: int = int(os.environ.get("NEWS_MAX_ARTICLES", "8"))
 
 # ── Observability ─────────────────────────────────────────────────────────────
 # When True, logs per-stage latency (search / scrape / rerank / gen) to console
