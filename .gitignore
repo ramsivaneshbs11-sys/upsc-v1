@@ -26,6 +26,12 @@ uploads/
 scratch/
 .pytest_cache/
 
+# Node / Web Frontend
+node_modules/
+dist/
+.vite/
+build/
+
 # Document files & page visual renders
 *.pdf
 *.png

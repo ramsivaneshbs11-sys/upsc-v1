@@ -1,0 +1,113 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --upsc-navy: #2B3990;
+  --upsc-gold: #B89456;
+  --upsc-maroon: #8B0000;
+
+  /* Elegant Light Theme */
+  --bg-main: #FFFFFF;
+  --bg-dark: #F8FAFC;
+  --bg-card: #F1F5F9;
+  --text-main: #0F172A;
+  --text-muted: #64748B;
+  /* Significantly more visible borders */
+  --border-color: #CBD5E1; 
+  --border-strong: #94A3B8;
+  --bg-card: #F8FAFC;
+  --shadow-premium: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background: var(--bg-main);
+  color: var(--text-main);
+  overflow-x: hidden;
+  margin: 0;
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-white bg-opacity-90 backdrop-blur-md border border-gray-200 rounded-3xl shadow-xl transition-all duration-300;
+  }
+
+  .sidebar-item {
+    @apply flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition-all duration-200 cursor-pointer text-slate-500 hover:text-upsc-navy hover:bg-slate-100 text-xs font-semibold;
+  }
+
+  .sidebar-item:hover {
+    background-color: rgba(43, 57, 144, 0.2);
+    /* upsc-navy with 20% opacity */
+  }
+
+  .sidebar-item.active {
+    @apply bg-upsc-navy text-white font-medium shadow-md;
+    box-shadow: 0 4px 12px rgba(43, 57, 144, 0.15);
+  }
+
+  .btn-primary {
+    @apply bg-upsc-navy hover:bg-opacity-90 text-white font-semibold py-2 px-6 rounded-xl transition-all active:scale-95 shadow-md hover:shadow-lg;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #e2e8f0;
+    border-radius: 10px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #cbd5e1;
+  }
+}
+
+.gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-upsc-navy to-upsc-gold;
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #f0f0f0 25%, #f8f8f8 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* Hide scrollbar but allow scroll */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Animations */
+.fade-in {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin Portal — Subject Folder Storage System (React)</title>
+  <!-- Google Fonts: Outfit & Plus Jakarta Sans -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- React 18 & Babel UMD for zero-setup instant browser preview -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Standalone React Component Execution -->
+  <script type="text/babel">
+    const { useState, useRef, useCallback, useEffect } = React;
+
+    const INITIAL_SUBJECTS = [
+      'Computer Science',
+      'Mathematics',
+      'Physics',
+      'Chemistry',
+      'Biology',
+      'Economics',
+      'Business Administration',
+      'History',
+      'Polity & Governance',
+      'Literature'
+    ];
+
+    const INITIAL_STORED_DOCS = [
+      {
+        id: 'doc-1',
+        fileName: 'Data_Structures_Algorithm_Notes.pdf',
+        subject: 'Computer Science',
+        fileSize: '4.2 MB',
+        uploadedAt: 'Today at 09:30 AM'
+      },
+      {
+        id: 'doc-2',
+        fileName: 'Operating_Systems_Core_Concepts.pdf',
+        subject: 'Computer Science',
+        fileSize: '6.1 MB',
+        uploadedAt: 'Today at 10:15 AM'
+      },
+      {
+        id: 'doc-3',
+        fileName: 'Calculus_and_Linear_Algebra_Vol1.pdf',
+        subject: 'Mathematics',
+        fileSize: '8.7 MB',
+        uploadedAt: 'Yesterday at 04:15 PM'
+      },
+      {
+        id: 'doc-4',
+        fileName: 'Macroeconomics_Theory_and_Policy.pdf',
+        subject: 'Economics',
+        fileSize: '5.4 MB',
+        uploadedAt: 'Aug 27, 2026'
+      }
+    ];
+
+    const Icon = ({ name, className = "" }) => {
+      const iconRef = useRef(null);
+      useEffect(() => {
+        if (window.lucide && iconRef.current) {
+          window.lucide.createIcons();
+        }
+      }, [name]);
+      return <i data-lucide={name} ref={iconRef} className={className}></i>;
+    };
+
+    function AdminPdfStorage() {
+      const [activeTab, setActiveTab] = useState('upload');
+      const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+      const [selectedFolder, setSelectedFolder] = useState(null);
+
+      const [subjects, setSubjects] = useState(INITIAL_SUBJECTS);
+      const [selectedSubject, setSelectedSubject] = useState('');
+      const [isSelectDropdownOpen, setIsSelectDropdownOpen] = useState(false);
+
+      const [isAddingNewSubject, setIsAddingNewSubject] = useState(false);
+      const [newSubjectInput, setNewSubjectInput] = useState('');
+
+      const [pdfFile, setPdfFile] = useState(null);
+      const [isDragging, setIsDragging] = useState(false);
+      const [isUploading, setIsUploading] = useState(false);
+      const [uploadProgress, setUploadProgress] = useState(0);
+      const [errorMsg, setErrorMsg] = useState(null);
+      const [successMsg, setSuccessMsg] = useState(null);
+      const [isSaving, setIsSaving] = useState(false);
+
+      const [storedDocs, setStoredDocs] = useState(INITIAL_STORED_DOCS);
+      const [searchQuery, setSearchQuery] = useState('');
+
+      const fileInputRef = useRef(null);
+      const selectDropdownRef = useRef(null);
+
+      useEffect(() => {
+        const handleClickOutside = (e) => {
+          if (selectDropdownRef.current && !selectDropdownRef.current.contains(e.target)) {
+            setIsSelectDropdownOpen(false);
+          }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+      }, []);
+
+      const formatFileSize = (bytes) => {
+        if (!bytes || bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+      };
+
+      const handleAddNewSubject = () => {
+        const trimmed = newSubjectInput.trim();
+        if (!trimmed) {
+          setErrorMsg('Please enter a valid subject folder name.');
+          setTimeout(() => setErrorMsg(null), 3000);
+          return;
+        }
+
+        if (subjects.some(s => s.toLowerCase() === trimmed.toLowerCase())) {
+          setErrorMsg('This subject folder already exists.');
+          setTimeout(() => setErrorMsg(null), 3000);
+          return;
+        }
+
+        const updated = [...subjects, trimmed].sort();
+        setSubjects(updated);
+        setSelectedSubject(trimmed);
+        setNewSubjectInput('');
+        setIsAddingNewSubject(false);
+        setIsSelectDropdownOpen(false);
+        setSuccessMsg(`Subject folder "${trimmed}" created successfully!`);
+        setTimeout(() => setSuccessMsg(null), 3000);
+      };
+
+      const processFile = useCallback((file) => {
+        if (!file) return;
+
+        const isPdfType = file.type === 'application/pdf';
+        const isPdfExt = file.name.toLowerCase().endsWith('.pdf');
+
+        if (!isPdfType && !isPdfExt) {
+          setErrorMsg('Invalid file format. Only PDF files (.pdf) are accepted.');
+          setTimeout(() => setErrorMsg(null), 4000);
+          return;
+        }
+
+        setErrorMsg(null);
+        setIsUploading(true);
+        setUploadProgress(0);
+
+        let progress = 0;
+        const interval = setInterval(() => {
+          progress += 25;
+          setUploadProgress(progress);
+
+          if (progress >= 100) {
+            clearInterval(interval);
+            setTimeout(() => {
+              setIsUploading(false);
+              setPdfFile({
+                fileObj: file,
+                name: file.name,
+                size: formatFileSize(file.size),
+                rawSize: file.size
+              });
+            }, 200);
+          }
+        }, 90);
+      }, []);
+
+      const handleDragEnter = (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
+      const handleDragOver = (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
+      const handleDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); };
+      const handleDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          processFile(e.dataTransfer.files[0]);
+        }
+      };
+
+      const handleRemoveFile = () => {
+        setPdfFile(null);
+        setUploadProgress(0);
+        setErrorMsg(null);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      };
+
+      const handleSaveDoc = () => {
+        if (!selectedSubject || !pdfFile || isSaving) return;
+
+        setIsSaving(true);
+
+        setTimeout(() => {
+          const newDoc = {
+            id: `doc-${Date.now()}`,
+            fileName: pdfFile.name,
+            subject: selectedSubject,
+            fileSize: pdfFile.size,
+            uploadedAt: 'Just now'
+          };
+
+          setStoredDocs(prev => [newDoc, ...prev]);
+          setIsSaving(false);
+          setSuccessMsg(`PDF "${pdfFile.name}" saved into subject folder "${selectedSubject}"!`);
+          handleRemoveFile();
+
+          setTimeout(() => {
+            setSuccessMsg(null);
+            setSelectedFolder(selectedSubject);
+            setActiveTab('storage');
+          }, 1000);
+        }, 800);
+      };
+
+      const handleDeleteDoc = (docId) => {
+        setStoredDocs(prev => prev.filter(d => d.id !== docId));
+        setSuccessMsg('PDF document removed from folder.');
+        setTimeout(() => setSuccessMsg(null), 3000);
+      };
+
+      const handleDeleteFolder = (subjectName, e) => {
+        e.stopPropagation();
+        if (confirm(`Are you sure you want to delete folder "${subjectName}" and all its PDF contents?`)) {
+          setSubjects(prev => prev.filter(s => s !== subjectName));
+          setStoredDocs(prev => prev.filter(d => d.subject !== subjectName));
+          if (selectedFolder === subjectName) setSelectedFolder(null);
+          setSuccessMsg(`Folder "${subjectName}" deleted.`);
+          setTimeout(() => setSuccessMsg(null), 3000);
+        }
+      };
+
+      const getDocsBySubject = (subjectName) => {
+        return storedDocs.filter(d => d.subject === subjectName);
+      };
+
+      const filteredFolders = subjects.filter(subjectName => {
+        if (!searchQuery.trim()) return true;
+        const q = searchQuery.toLowerCase();
+        const matchesFolder = subjectName.toLowerCase().includes(q);
+        const matchesFiles = getDocsBySubject(subjectName).some(d => d.fileName.toLowerCase().includes(q));
+        return matchesFolder || matchesFiles;
+      });
+
+      const currentFolderDocs = selectedFolder 
+        ? storedDocs.filter(d => d.subject === selectedFolder && d.fileName.toLowerCase().includes(searchQuery.toLowerCase()))
+        : [];
+
+      const isFormValid = Boolean(selectedSubject && pdfFile && !isUploading);
+
+      return (
+        <div className="admin-app-layout">
+          {/* Sidebar Navigation */}
+          <aside className={`admin-sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
+            <div className="sidebar-header">
+              <img src="logo.png" alt="Logo" className="sidebar-logo" />
+              {!isSidebarCollapsed && (
+                <div className="sidebar-brand-text">
+                  <span className="brand-name">ADMIN PORTAL</span>
+                  <span className="brand-sub">PDF Storage Center</span>
+                </div>
+              )}
+            </div>
+
+            <div className="sidebar-menu">
+              <span className="menu-label">{isSidebarCollapsed ? 'MENU' : 'MANAGEMENT'}</span>
+              
+              <button
+                type="button"
+                className={`nav-item ${activeTab === 'upload' ? 'active' : ''}`}
+                onClick={() => setActiveTab('upload')}
+                title="Upload PDF"
+              >
+                <Icon name="upload-cloud" className="nav-icon" />
+                {!isSidebarCollapsed && <span className="nav-text">Upload PDF</span>}
+              </button>
+
+              <button
+                type="button"
+                className={`nav-item ${activeTab === 'storage' ? 'active' : ''}`}
+                onClick={() => {
+                  setActiveTab('storage');
+                  setSelectedFolder(null);
+                }}
+                title="PDF Storage Folders"
+              >
+                <Icon name="folder" className="nav-icon" />
+                {!isSidebarCollapsed && (
+                  <div className="nav-text-group">
+                    <span className="nav-text">PDF Storage</span>
+                    <span className="nav-badge">{storedDocs.length} Docs</span>
+                  </div>
+                )}
+              </button>
+            </div>
+
+            <div className="sidebar-footer">
+              <div className="system-status">
+                <span className="pulse-dot"></span>
+                {!isSidebarCollapsed && <span className="status-text">System Active</span>}
+              </div>
+            </div>
+          </aside>
+
+          {/* Main Content Area */}
+          <div className="admin-main-wrapper">
+            <header className="admin-topbar">
+              <div className="topbar-title-group">
+                <button
+                  type="button"
+                  className="toggle-sidebar-btn"
+                  onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+                  title="Toggle Sidebar"
+                >
+                  <Icon name="menu" />
+                </button>
+                <h2 className="topbar-title">
+                  {activeTab === 'upload' 
+                    ? 'Upload & Assign PDF to Subject Folder' 
+                    : selectedFolder 
+                    ? `Subject Folder: ${selectedFolder}` 
+                    : 'Subject Folders Repository'}
+                </h2>
+              </div>
+            </header>
+
+            <main className="admin-content">
+              {errorMsg && (
+                <div className="toast error">
+                  <Icon name="alert-circle" className="toast-icon" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+              {successMsg && (
+                <div className="toast success">
+                  <Icon name="check-circle-2" className="toast-icon text-success" />
+                  <span>{successMsg}</span>
+                </div>
+              )}
+
+              {activeTab === 'upload' && (
+                <div className="content-card fade-in">
+                  <div className="card-header">
+                    <img src="logo.png" alt="Logo" style={{ height: '52px', width: 'auto', objectFit: 'contain', flexShrink: 0 }} />
+                    <div>
+                      <h2 className="card-title">Upload PDF into Subject Folder</h2>
+                      <p className="card-description">
+                        Select a subject folder or create a new one, attach your PDF file, and save it to storage.
+                      </p>
+                    </div>
+                  </div>
+
+                  <form className="form-body" onSubmit={(e) => e.preventDefault()}>
+                    <div className="form-group">
+                      <div className="form-label-row">
+                        <label htmlFor="subjectSelect" className="form-label">
+                          <span>1. Select or Create Subject Folder</span>
+                          <span className="required-star">*</span>
+                        </label>
+
+                        {!isAddingNewSubject && (
+                          <button
+                            type="button"
+                            className="btn-create-subject-pill"
+                            onClick={() => setIsAddingNewSubject(true)}
+                          >
+                            <Icon name="plus" /> Add New Subject Folder
+                          </button>
+                        )}
+                      </div>
+
+                      {isAddingNewSubject ? (
+                        <div className="new-subject-box">
+                          <div className="input-with-icon">
+                            <Icon name="book-open" className="input-icon" />
+                            <input
+                              type="text"
+                              className="custom-input"
+                              placeholder="Enter new subject folder name..."
+                              value={newSubjectInput}
+                              onChange={(e) => setNewSubjectInput(e.target.value)}
+                              onKeyDown={(e) => e.key === 'Enter' && handleAddNewSubject()}
+                              autoFocus
+                            />
+                          </div>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <button
+                              type="button"
+                              className="btn-secondary-sm"
+                              onClick={() => {
+                                setIsAddingNewSubject(false);
+                                setNewSubjectInput('');
+                              }}
+                            >
+                              <Icon name="x" /> Cancel
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-primary-sm"
+                              onClick={handleAddNewSubject}
+                            >
+                              <Icon name="check" /> Create Folder
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="custom-dropdown-container" ref={selectDropdownRef}>
+                          <button
+                            type="button"
+                            className={`custom-dropdown-trigger ${isSelectDropdownOpen ? 'open' : ''} ${selectedSubject ? 'selected' : ''}`}
+                            onClick={() => setIsSelectDropdownOpen(!isSelectDropdownOpen)}
+                          >
+                            <div className="trigger-left">
+                              <Icon name="folder" className="trigger-folder-icon" />
+                              <span className="trigger-text">
+                                {selectedSubject ? selectedSubject : 'Select Subject Folder...'}
+                              </span>
+                            </div>
+                            <Icon name="chevron-down" className={`trigger-chevron ${isSelectDropdownOpen ? 'rotated' : ''}`} />
+                          </button>
+
+                          {isSelectDropdownOpen && (
+                            <div className="custom-dropdown-menu">
+                              <div className="dropdown-menu-header">
+                                <span>AVAILABLE SUBJECT FOLDERS</span>
+                                <span className="count-tag">{subjects.length} Folders</span>
+                              </div>
+
+                              <div className="dropdown-menu-list">
+                                {subjects.map((subj) => {
+                                  const count = getDocsBySubject(subj).length;
+                                  const isSelected = selectedSubject === subj;
+                                  return (
+                                    <button
+                                      key={subj}
+                                      type="button"
+                                      className={`dropdown-menu-item ${isSelected ? 'selected' : ''}`}
+                                      onClick={() => {
+                                        setSelectedSubject(subj);
+                                        setIsSelectDropdownOpen(false);
+                                      }}
+                                    >
+                                      <div className="item-left">
+                                        <Icon name="folder" className="item-folder-icon" />
+                                        <span className="item-title">{subj}</span>
+                                      </div>
+                                      <span className="item-count-badge">
+                                        {count} {count === 1 ? 'file' : 'files'}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+
+                              <div className="dropdown-menu-footer">
+                                <button
+                                  type="button"
+                                  className="btn-dropdown-add"
+                                  onClick={() => {
+                                    setIsSelectDropdownOpen(false);
+                                    setIsAddingNewSubject(true);
+                                  }}
+                                >
+                                  <Icon name="plus" /> Create New Subject Folder
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">
+                        <span>2. Upload PDF File</span>
+                        <span className="required-star">*</span>
+                      </label>
+
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".pdf,application/pdf"
+                        className="file-input"
+                        onChange={(e) => processFile(e.target.files[0])}
+                      />
+
+                      {!pdfFile && !isUploading && (
+                        <div
+                          className={`dropzone ${isDragging ? 'drag-over' : ''}`}
+                          onDragEnter={handleDragEnter}
+                          onDragOver={handleDragOver}
+                          onDragLeave={handleDragLeave}
+                          onDrop={handleDrop}
+                          onClick={() => fileInputRef.current?.click()}
+                          tabIndex={0}
+                          role="button"
+                        >
+                          <div className="dropzone-content">
+                            <div className="upload-icon-wrapper">
+                              <Icon name="upload-cloud" className="upload-icon" />
+                            </div>
+                            <h3 className="dropzone-heading">Drag &amp; drop your PDF here</h3>
+                            <span className="dropzone-divider">or</span>
+                            <button
+                              type="button"
+                              className="btn-secondary"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                fileInputRef.current?.click();
+                              }}
+                            >
+                              <Icon name="file-text" className="btn-icon" />
+                              <span>Choose PDF</span>
+                            </button>
+                            <p className="dropzone-hint">Only PDF files are supported (Max size: 25MB)</p>
+                          </div>
+                        </div>
+                      )}
+
+                      {isUploading && (
+                        <div className="uploading-state">
+                          <div className="upload-spinner-box">
+                            <div className="spinner"></div>
+                          </div>
+                          <div className="uploading-info">
+                            <span className="uploading-text">Reading &amp; validating PDF file...</span>
+                            <div className="progress-bar-bg">
+                              <div className="progress-bar-fill" style={{ width: `${uploadProgress}%` }}></div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {pdfFile && !isUploading && (
+                        <div className="file-card">
+                          <div className="file-info-main">
+                            <div className="file-badge">
+                              <Icon name="file-text" className="pdf-file-icon" />
+                            </div>
+                            <div className="file-details">
+                              <div className="file-title-row">
+                                <span className="file-name">{pdfFile.name}</span>
+                                <span className="status-chip success">
+                                  <Icon name="check-circle-2" className="chip-icon" /> Ready to Store
+                                </span>
+                              </div>
+                              <div className="file-meta">
+                                <span className="meta-item">{pdfFile.size}</span>
+                                <span className="meta-dot">•</span>
+                                <span className="meta-item text-success">Target Folder: {selectedSubject || 'Unassigned'}</span>
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="btn-remove"
+                            onClick={handleRemoveFile}
+                            title="Remove PDF"
+                          >
+                            <Icon name="trash-2" className="remove-icon" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="form-actions">
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={!isFormValid || isSaving}
+                        onClick={handleSaveDoc}
+                      >
+                        {isSaving ? (
+                          <>
+                            <div className="btn-spinner"></div>
+                            <span>Saving to Folder...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Icon name="folder-plus" className="btn-icon" />
+                            <span>Save &amp; Store PDF in Folder</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              )}
+
+              {activeTab === 'storage' && (
+                <div className="repository-section fade-in">
+                  <div className="repo-header">
+                    {selectedFolder ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <button
+                          type="button"
+                          className="btn-secondary-sm"
+                          onClick={() => setSelectedFolder(null)}
+                        >
+                          <Icon name="arrow-left" /> Back to All Folders
+                        </button>
+                        <div className="folder-title-badge">
+                          <Icon name="folder-open" style={{ color: '#f59e0b' }} />
+                          <span style={{ fontWeight: '800', color: '#0f2242', fontSize: '1.1rem' }}>{selectedFolder}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <div className="header-icon-box">
+                          <Icon name="folder" className="repo-icon" />
+                        </div>
+                        <div>
+                          <h3 className="repo-title">Subject Folders Repository</h3>
+                          <p className="repo-subtitle">Click on any subject folder to view its stored PDF files</p>
+                        </div>
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      className="btn-primary-sm"
+                      onClick={() => {
+                        setActiveTab('upload');
+                        if (selectedFolder) setSelectedSubject(selectedFolder);
+                      }}
+                    >
+                      <Icon name="plus" /> Upload PDF to Folder
+                    </button>
+                  </div>
+
+                  <div className="repo-toolbar">
+                    <div className="search-box">
+                      <Icon name="search" className="search-icon" />
+                      <input
+                        type="text"
+                        className="search-input"
+                        placeholder={selectedFolder ? `Search files inside ${selectedFolder}...` : "Search subject folders or file names..."}
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  {!selectedFolder && (
+                    <div className="folders-grid">
+                      {filteredFolders.length === 0 ? (
+                        <div className="empty-docs">
+                          <Icon name="folder" className="empty-icon" />
+                          <p className="empty-title">No subject folders found</p>
+                          <p className="empty-subtitle">Create a subject folder in the Upload section to begin storing PDFs.</p>
+                        </div>
+                      ) : (
+                        filteredFolders.map((subjName) => {
+                          const docsInSubj = getDocsBySubject(subjName);
+                          return (
+                            <div
+                              key={subjName}
+                              className="folder-card"
+                              onClick={() => setSelectedFolder(subjName)}
+                            >
+                              <div className="folder-card-header">
+                                <div className="folder-icon-box">
+                                  <Icon name="folder" className="folder-svg" />
+                                </div>
+                                <button
+                                  type="button"
+                                  className="btn-delete-folder"
+                                  title="Delete Subject Folder"
+                                  onClick={(e) => handleDeleteFolder(subjName, e)}
+                                >
+                                  <Icon name="trash-2" />
+                                </button>
+                              </div>
+
+                              <div className="folder-card-body">
+                                <h4 className="folder-name">{subjName}</h4>
+                                <p className="folder-doc-count">
+                                  <Icon name="files" /> {docsInSubj.length} {docsInSubj.length === 1 ? 'PDF File' : 'PDF Files'}
+                                </p>
+                              </div>
+
+                              <div className="folder-card-footer">
+                                <span className="open-folder-text">Open Folder</span>
+                                <Icon name="chevron-right" className="chevron-icon" />
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
+
+                  {selectedFolder && (
+                    <div className="folder-inside-view">
+                      <div className="inside-folder-meta-banner">
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <Icon name="folder-open" style={{ color: '#f59e0b', width: '22px', height: '22px' }} />
+                          <div>
+                            <h4 style={{ fontSize: '1rem', fontWeight: '800', color: '#0f2242' }}>{selectedFolder}</h4>
+                            <p style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                              Contains {currentFolderDocs.length} PDF {currentFolderDocs.length === 1 ? 'document' : 'documents'}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      {currentFolderDocs.length === 0 ? (
+                        <div className="empty-docs">
+                          <Icon name="file-text" className="empty-icon" />
+                          <p className="empty-title">This subject folder is empty</p>
+                          <p className="empty-subtitle">Upload a PDF file to store it inside the "{selectedFolder}" folder.</p>
+                          <button
+                            type="button"
+                            className="btn-primary-sm"
+                            style={{ marginTop: '12px' }}
+                            onClick={() => {
+                              setSelectedSubject(selectedFolder);
+                              setActiveTab('upload');
+                            }}
+                          >
+                            <Icon name="plus" /> Upload PDF to {selectedFolder}
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="docs-list">
+                          {currentFolderDocs.map((doc) => (
+                            <div key={doc.id} className="doc-row">
+                              <div className="doc-main">
+                                <div className="doc-icon-box">
+                                  <Icon name="file-text" className="doc-file-icon" />
+                                </div>
+                                <div className="doc-info">
+                                  <div className="doc-name-row">
+                                    <h4 className="doc-name">{doc.fileName}</h4>
+                                    <span className="subject-tag">{doc.subject}</span>
+                                  </div>
+                                  <div className="doc-meta">
+                                    <span>{doc.fileSize}</span>
+                                    <span className="meta-dot">•</span>
+                                    <span>Uploaded: {doc.uploadedAt}</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="doc-actions">
+                                <button
+                                  type="button"
+                                  className="btn-icon-action"
+                                  title="View PDF"
+                                  onClick={() => alert(`Opening "${doc.fileName}" from "${doc.subject}" folder`)}
+                                >
+                                  <Icon name="eye" />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-icon-action"
+                                  title="Download PDF"
+                                  onClick={() => alert(`Downloading "${doc.fileName}"`)}
+                                >
+                                  <Icon name="download" />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-icon-danger"
+                                  title="Delete File"
+                                  onClick={() => handleDeleteDoc(doc.id)}
+                                >
+                                  <Icon name="trash-2" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </main>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<AdminPdfStorage />);
+  </script>
+
+  <!-- Vite module entry fallback -->
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
